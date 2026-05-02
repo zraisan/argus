@@ -19,11 +19,20 @@ target_include_directories(argus
     utils
 )
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET
+    libavformat
+    libavcodec
+    libswscale
+    libavutil
+)
+
 target_link_libraries(argus
   PRIVATE
     CUDA::cudart
     nvinfer
     nvonnxparser
+    PkgConfig::LIBAV
 )
 
 
