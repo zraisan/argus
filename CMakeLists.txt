@@ -35,4 +35,9 @@ target_link_libraries(argus
     PkgConfig::LIBAV
 )
 
-
+add_executable(libav_play src/live.cxx)                                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                                          
+target_link_libraries(libav_play
+  PRIVATE                                                                                                                                                                                                                                                                                                 
+    PkgConfig::LIBAV                                   
+)

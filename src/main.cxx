@@ -22,6 +22,7 @@ class Logger : public ILogger {
 } logger;
 
 int main() {
+  // Build the network from an ONNX file
   std::unique_ptr<IBuilder> builder{createInferBuilder(logger)};
   std::unique_ptr<INetworkDefinition> network{builder->createNetworkV2(
       1U << static_cast<uint32_t>(
@@ -41,9 +42,9 @@ int main() {
     Dims optDims = input->getDimensions();
     Dims maxDims = input->getDimensions();
 
-    minDims.d[0] = 1;
-    optDims.d[0] = 4;
-    maxDims.d[0] = 16;
+    minDims.d[0] = 1;  // Set minimum batch value
+    optDims.d[0] = 4;  // Set most likely to be used batch value
+    maxDims.d[0] = 16; // Set maximum batch value
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMIN,
                            minDims);
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kOPT,
@@ -51,7 +52,8 @@ int main() {
     profile->setDimensions(input->getName(), nvinfer1::OptProfileSelector::kMAX,
                            maxDims);
   }
-  config->addOptimizationProfile(profile);
+  config->addOptimizationProfile(
+      profile); // Add the optimization profile to allow for dynamic batch size
 
   std::unique_ptr<IHostMemory> serializedModel{
       builder->buildSerializedNetwork(*network, *config)};
@@ -60,8 +62,11 @@ int main() {
       serializedModel->data(), serializedModel->size())};
   std::unique_ptr<IExecutionContext> context{engine->createExecutionContext()};
 
-  std::vector<void *> buffers(engine->getNbIOTensors(), nullptr);
+  std::vector<void *> buffers(
+      engine->getNbIOTensors(),
+      nullptr); // Buffers to allocate data from CPU memory to GPU memory
 
+  // Initialize the inputs with batch size
   for (int32_t i = 0; i < network->getNbInputs(); i++) {
     ITensor *input = network->getInput(i);
     Dims dims = input->getDimensions();
