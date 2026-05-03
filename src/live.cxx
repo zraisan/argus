@@ -1,6 +1,7 @@
 #include <iostream>
 
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 }
 
@@ -75,6 +76,72 @@ int main() {
     std::cout << "\tCodec " << pLocalCodec->name << " ID " << pLocalCodec->id
               << " bit_rate " << pLocalCodecParameters->bit_rate << std::endl;
   }
+  if (video_stream_index == -1) {
+    std::cout << "Stream does not contain a video stream!" << std::endl;
+    return -1;
+  }
+
+  AVCodecContext *pCodecContext = avcodec_alloc_context3(pCodec);
+  if (!pCodecContext) {
+    std::cout << "failed to allocated memory for AVCodecContext" << std::endl;
+    return -1;
+  }
+
+  if (avcodec_parameters_to_context(pCodecContext, pCodecParameters) < 0) {
+    std::cout << "failed to copy codec params to codec context" << std::endl;
+    return -1;
+  }
+
+  if (avcodec_open2(pCodecContext, pCodec, NULL) < 0) {
+    std::cout << "failed to open codec through avcodec_open2" << std::endl;
+    return -1;
+  }
+
+  AVFrame *pFrame = av_frame_alloc();
+  if (!pFrame) {
+    std::cout << "failed to allocate memory for AVFrame" << std::endl;
+    return -1;
+  }
+  AVPacket *pPacket = av_packet_alloc();
+  if (!pPacket) {
+    std::cout << "failed to allocate memory for AVPacket" << std::endl;
+    return -1;
+  }
+
+  while (av_read_frame(pFormatContext, pPacket) >= 0) {
+    if (pPacket->stream_index == video_stream_index) {
+      std::cout << "AVPacket->pts " << pPacket->pts << std::endl;
+
+      if (avcodec_send_packet(pCodecContext, pPacket) < 0) {
+        std::cout << "Error sending packet to decoder" << std::endl;
+        break;
+      }
+
+      while (true) {
+        int r = avcodec_receive_frame(pCodecContext, pFrame);
+        if (r == AVERROR(EAGAIN) || r == AVERROR_EOF)
+          break;
+        if (r < 0) {
+          std::cout << "Error receiving frame from decoder" << std::endl;
+          break;
+        }
+
+        std::cout << "Frame " << pCodecContext->frame_num << " "
+                  << pFrame->width << "x" << pFrame->height
+                  << " format=" << pFrame->format << " pts=" << pFrame->pts
+                  << std::endl;
+        // hand pFrame off to swscale → TRT here
+      }
+    }
+    av_packet_unref(pPacket);
+  }
+
+  std::cout << "releasing all the resources" << std::endl;
+
+  avformat_close_input(&pFormatContext);
+  av_packet_free(&pPacket);
+  av_frame_free(&pFrame);
+  avcodec_free_context(&pCodecContext);
 
   return 0;
 }
