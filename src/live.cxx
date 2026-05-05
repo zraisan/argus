@@ -1,30 +1,50 @@
+#include "live.hxx"
+#include <cstdint>
+#include <cuda_runtime_api.h>
 #include <iostream>
+#include <memory>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libswscale/swscale.h>
 }
 
-int main() {
+using namespace nvinfer1;
+
+void preprocess(const uint8_t *src, float *dst) {
+  constexpr int nPixels = 640 * 640;
+  for (int k = 0; k < nPixels; k++) {
+    dst[k] = src[3 * k] / 255.0f;
+    dst[nPixels + k] = src[3 * k + 1] / 255.0f;
+    dst[2 * nPixels + k] = src[3 * k + 2] / 255.0f;
+  }
+}
+
+void runLiveStream(IExecutionContext *trtContext, void *inputBuffer,
+                   std::size_t inputBytes, void *outputBuffer,
+                   std::size_t outputBytes, cudaStream_t stream) {
+  std::unique_ptr<float[]> hostOutput{new float[outputBytes / sizeof(float)]};
+
   AVFormatContext *pFormatContext = avformat_alloc_context();
   if (!pFormatContext) {
     std::cout << "ERROR could not allocate memory for Format Context"
               << std::endl;
-    return -1;
+    return;
   }
   if (avformat_open_input(
           &pFormatContext,
           "rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream", NULL,
           NULL) != 0) {
     std::cout << "ERROR could not open the file" << std::endl;
-    return -1;
+    return;
   }
   std::cout << "format " << pFormatContext->iformat->name << ", duration "
             << pFormatContext->duration << " us"
             << ", bit_rate " << pFormatContext->bit_rate << std::endl;
   if (avformat_find_stream_info(pFormatContext, NULL) < 0) {
     std::cout << "ERROR could not get the stream info";
-    return -1;
+    return;
   }
 
   const AVCodec *pCodec = NULL;
@@ -78,34 +98,34 @@ int main() {
   }
   if (video_stream_index == -1) {
     std::cout << "Stream does not contain a video stream!" << std::endl;
-    return -1;
+    return;
   }
 
   AVCodecContext *pCodecContext = avcodec_alloc_context3(pCodec);
   if (!pCodecContext) {
     std::cout << "failed to allocated memory for AVCodecContext" << std::endl;
-    return -1;
+    return;
   }
 
   if (avcodec_parameters_to_context(pCodecContext, pCodecParameters) < 0) {
     std::cout << "failed to copy codec params to codec context" << std::endl;
-    return -1;
+    return;
   }
 
   if (avcodec_open2(pCodecContext, pCodec, NULL) < 0) {
     std::cout << "failed to open codec through avcodec_open2" << std::endl;
-    return -1;
+    return;
   }
 
   AVFrame *pFrame = av_frame_alloc();
   if (!pFrame) {
     std::cout << "failed to allocate memory for AVFrame" << std::endl;
-    return -1;
+    return;
   }
   AVPacket *pPacket = av_packet_alloc();
   if (!pPacket) {
     std::cout << "failed to allocate memory for AVPacket" << std::endl;
-    return -1;
+    return;
   }
 
   while (av_read_frame(pFormatContext, pPacket) >= 0) {
@@ -116,7 +136,16 @@ int main() {
         std::cout << "Error sending packet to decoder" << std::endl;
         break;
       }
+      SwsContext *context = sws_getContext(
+          pCodecContext->width, pCodecContext->height, pCodecContext->pix_fmt,
+          640, 640, AV_PIX_FMT_RGB24, SWS_BILINEAR, NULL, NULL,
+          NULL); // Make flags and params an input, same for all
+                 // current NULL values
 
+      std::unique_ptr<uint8_t[]> dstBuff{new uint8_t[640 * 640 * 3]};
+      uint8_t *dstRGB[1] = {dstBuff.get()};
+      int dstStride[1] = {640 * 3};
+      std::unique_ptr<float[]> floatBuf{new float[3 * 640 * 640]};
       while (true) {
         int r = avcodec_receive_frame(pCodecContext, pFrame);
         if (r == AVERROR(EAGAIN) || r == AVERROR_EOF)
@@ -130,8 +159,18 @@ int main() {
                   << pFrame->width << "x" << pFrame->height
                   << " format=" << pFrame->format << " pts=" << pFrame->pts
                   << std::endl;
-        // hand pFrame off to swscale → TRT here
+        sws_scale(context, pFrame->data, pFrame->linesize, 0, pFrame->height,
+                  dstRGB, dstStride);
+        preprocess(dstBuff.get(), floatBuf.get());
+
+        cudaMemcpyAsync(inputBuffer, floatBuf.get(), inputBytes,
+                        cudaMemcpyHostToDevice, stream);
+        trtContext->enqueueV3(stream);
+        cudaMemcpyAsync(hostOutput.get(), outputBuffer, outputBytes,
+                        cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
       }
+      sws_freeContext(context);
     }
     av_packet_unref(pPacket);
   }
@@ -142,6 +181,4 @@ int main() {
   av_packet_free(&pPacket);
   av_frame_free(&pFrame);
   avcodec_free_context(&pCodecContext);
-
-  return 0;
 }

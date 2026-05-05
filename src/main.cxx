@@ -1,6 +1,7 @@
 #include "NvInfer.h"
 #include "NvOnnxParser.h"
 #include "cuda.hxx"
+#include "live.hxx"
 #include <NvInferRuntime.h>
 #include <NvInferRuntimeBase.h>
 #include <cstddef>
@@ -70,13 +71,18 @@ int main() {
   for (int32_t i = 0; i < network->getNbInputs(); i++) {
     ITensor *input = network->getInput(i);
     Dims dims = input->getDimensions();
-    dims.d[0] = 4;
+    dims.d[0] = 1;
     context->setInputShape(input->getName(), dims);
   }
 
+  void *inputBuffer = nullptr;
+  void *outputBuffer = nullptr;
+  size_t inputBytes = 0;
+  size_t outputBytes = 0;
+
   for (int32_t i = 0; i < engine->getNbIOTensors(); i++) {
     auto const name = engine->getIOTensorName(i);
-    Dims dims = engine->getTensorShape(name);
+    Dims dims = context->getTensorShape(name);
     uint64_t elements = 1;
     for (int j = 0; j < dims.nbDims; j++)
       elements *= dims.d[j];
@@ -84,7 +90,23 @@ int main() {
     size_t bytes = elements * elemSize(type);
     cudaMalloc(&buffers[i], bytes);
     context->setTensorAddress(name, buffers[i]);
+
+    if (engine->getTensorIOMode(name) == TensorIOMode::kINPUT) {
+      inputBuffer = buffers[i];
+      inputBytes = bytes;
+    } else {
+      outputBuffer = buffers[i];
+      outputBytes = bytes;
+    }
   }
+
+  cudaStream_t stream;
+  cudaStreamCreate(&stream);
+
+  runLiveStream(context.get(), inputBuffer, inputBytes, outputBuffer,
+                outputBytes, stream);
+
+  cudaStreamDestroy(stream);
 
   return 0;
 }

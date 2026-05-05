@@ -11,7 +11,9 @@ add_executable(argus)
 target_sources(argus
   PRIVATE
     src/main.cxx
+    src/live.cxx
     utils/cuda.cxx
+    src/image.cxx
 )
 
 target_include_directories(argus
@@ -35,9 +37,3 @@ target_link_libraries(argus
     PkgConfig::LIBAV
 )
 
-add_executable(libav_play src/live.cxx)                                                                                                                                                                                                                                                             
-                                                                                                                                                                                                                                                                                                          
-target_link_libraries(libav_play
-  PRIVATE                                                                                                                                                                                                                                                                                                 
-    PkgConfig::LIBAV                                   
-)
