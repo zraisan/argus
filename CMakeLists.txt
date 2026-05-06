@@ -11,9 +11,10 @@ add_executable(argus)
 target_sources(argus
   PRIVATE
     src/main.cxx
-    src/live.cxx
+    src/engine.cxx
+    src/decoder.cxx
+    src/preprocess.cxx
     utils/cuda.cxx
-    src/image.cxx
 )
 
 target_include_directories(argus
