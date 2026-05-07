@@ -14,6 +14,7 @@ target_sources(argus
     src/engine.cxx
     src/decoder.cxx
     src/preprocess.cxx
+    src/postprocess.cxx
     utils/cuda.cxx
 )
 

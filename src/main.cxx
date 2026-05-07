@@ -2,7 +2,6 @@
 #include "engine.hxx"
 #include "postprocess.hxx"
 #include "preprocess.hxx"
-#include <ios>
 #include <iostream>
 #include <memory>
 #include <vector>
@@ -28,11 +27,10 @@ int main() {
     std::cout << "Frame pts=" << decoder.frame->pts << std::endl;
     preprocess(pre, decoder.frame, cpuInput.get());
     runInference(engine, cpuInput.get(), cpuOutput.get());
-    // postprocess(cpuOutput.get(), ...) — TODO
     std::vector<Detection> dets =
         postprocess(cpuOutput.get(), 100, decoder.codecCtx->width,
                     decoder.codecCtx->height);
-    // encode/draw/output     — TODO
+    draw_box(dets, decoder.frame);
   }
 
   destroyPreprocess(pre);

@@ -1,5 +1,9 @@
 #pragma once
 
+extern "C" {
+#include <libavutil/frame.h>
+}
+
 #include <vector>
 
 struct Detection {
@@ -10,3 +14,5 @@ struct Detection {
 
 std::vector<Detection> postprocess(const float *output, // [1, max_dets, 6]
                                    int maxDets, int srcW, int srcH);
+
+void draw_box(const std::vector<Detection> &dets, AVFrame *frame);
