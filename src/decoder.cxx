@@ -1,6 +1,31 @@
 #include "decoder.hxx"
 #include <iostream>
 
+const char *nvidia_decoder_name(AVCodecID codec_id) {
+  switch (codec_id) {
+  case AV_CODEC_ID_H264:
+    return "h264_cuvid";
+  case AV_CODEC_ID_HEVC:
+    return "hevc_cuvid";
+  case AV_CODEC_ID_AV1:
+    return "av1_cuvid";
+  case AV_CODEC_ID_MJPEG:
+    return "mjpeg_cuvid";
+  case AV_CODEC_ID_MPEG1VIDEO:
+    return "mpeg1_cuvid";
+  case AV_CODEC_ID_MPEG2VIDEO:
+    return "mpeg2_cuvid";
+  case AV_CODEC_ID_MPEG4:
+    return "mpeg4_cuvid";
+  case AV_CODEC_ID_VP8:
+    return "vp8_cuvid";
+  case AV_CODEC_ID_VP9:
+    return "vp9_cuvid";
+  default:
+    return nullptr;
+  }
+}
+
 bool openStream(Decoder &d, const char *url) {
   d.formatCtx = avformat_alloc_context();
   if (!d.formatCtx) {
@@ -25,7 +50,10 @@ bool openStream(Decoder &d, const char *url) {
     if (p->codec_type == AVMEDIA_TYPE_VIDEO && d.videoStreamIndex == -1) {
       d.videoStreamIndex = (int)i;
       codecParams = p;
-      codec = avcodec_find_decoder(p->codec_id);
+      if (const char *name = nvidia_decoder_name(p->codec_id))
+        codec = avcodec_find_decoder_by_name(name);
+      if (!codec)
+        codec = avcodec_find_decoder(p->codec_id);
       std::cout << "Video Codec: " << (codec ? codec->name : "(unknown)")
                 << " resolution " << p->width << "x" << p->height << std::endl;
       break;

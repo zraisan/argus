@@ -13,6 +13,8 @@ target_sources(argus
     src/main.cxx
     src/engine.cxx
     src/decoder.cxx
+    src/encoder.cxx
+    src/server.cxx
     src/preprocess.cxx
     src/postprocess.cxx
     utils/cuda.cxx
@@ -38,4 +40,3 @@ target_link_libraries(argus
     nvonnxparser
     PkgConfig::LIBAV
 )
-
