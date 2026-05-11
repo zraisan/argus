@@ -24,7 +24,7 @@ target_sources(argus
 target_include_directories(argus
   PRIVATE
     utils
-    third_party/cxxopts
+    libs
 )
 
 find_package(PkgConfig REQUIRED)

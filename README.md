@@ -33,7 +33,7 @@ step by step.
 ## Pipeline
 
 ```mermaid
-flowchart LR
+flowchart TD
     input[RTSP input] --> decoder[FFmpeg decoder]
     decoder --> frame[AVFrame]
     frame --> preprocess[Preprocess]
@@ -132,8 +132,8 @@ utils/
   ffmpeg_utils.* FFmpeg error helpers
   logger.*       timestamped logging
 
-third_party/
-  cxxopts/       command line option parsing
+libs/
+  cxxopts.hpp    command line option parsing
 ```
 
 ## Development Notes
