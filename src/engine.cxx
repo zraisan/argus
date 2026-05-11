@@ -1,8 +1,12 @@
 #include "engine.hxx"
 #include "NvOnnxParser.h"
-#include "cuda.hxx"
+#include "logger.hxx"
+#include <chrono>
 #include <cstdint>
-#include <iostream>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <vector>
 
 using namespace nvinfer1;
 using namespace nvonnxparser;
@@ -10,67 +14,285 @@ using namespace nvonnxparser;
 namespace {
 class TRTLogger : public ILogger {
   void log(Severity severity, const char *msg) noexcept override {
-    if (severity <= Severity::kWARNING)
-      std::cout << msg << std::endl;
+    if (severity <= Severity::kWARNING) {
+      LogLevel level = severity <= Severity::kERROR ? LOG_ERROR : LOG_WARNING;
+      log_msg(level, "tensorrt", msg);
+    }
   }
 } logger;
+
+std::string dims_string(Dims dims) {
+  std::ostringstream out;
+  for (int i = 0; i < dims.nbDims; i++) {
+    if (i > 0)
+      out << "x";
+    out << dims.d[i];
+  }
+  return out.str();
+}
+
+const char *data_type_name(DataType type) {
+  switch (type) {
+  case DataType::kFLOAT:
+    return "fp32";
+  case DataType::kHALF:
+    return "fp16";
+  case DataType::kINT8:
+    return "int8";
+  case DataType::kINT32:
+    return "int32";
+  case DataType::kBOOL:
+    return "bool";
+  case DataType::kUINT8:
+    return "uint8";
+  case DataType::kFP8:
+    return "fp8";
+  case DataType::kBF16:
+    return "bf16";
+  case DataType::kINT64:
+    return "int64";
+  case DataType::kINT4:
+    return "int4";
+  case DataType::kFP4:
+    return "fp4";
+  }
+  return "unknown";
+}
+
+std::size_t elem_size(DataType t) {
+  switch (t) {
+  case DataType::kFLOAT:
+    return 4;
+  case DataType::kHALF:
+    return 2;
+  case DataType::kBF16:
+    return 2;
+  case DataType::kINT32:
+    return 4;
+  case DataType::kINT64:
+    return 8;
+  case DataType::kINT8:
+    return 1;
+  case DataType::kBOOL:
+    return 1;
+  case DataType::kFP8:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+bool write_engine_file(const char *engine_path, const void *data,
+                       std::size_t size) {
+  if (!engine_path || engine_path[0] == '\0')
+    return false;
+
+  try {
+    std::filesystem::path engine_file(engine_path);
+    std::filesystem::path parent = engine_file.parent_path();
+    if (!parent.empty())
+      std::filesystem::create_directories(parent);
+  } catch (const std::filesystem::filesystem_error &err) {
+    log_msg(LOG_WARNING, "engine",
+            std::string("could not create TensorRT output directory: ") +
+                err.what());
+    return false;
+  }
+
+  std::ofstream file(engine_path, std::ios::binary | std::ios::trunc);
+  if (!file) {
+    log_msg(LOG_WARNING, "engine",
+            std::string("could not create TensorRT engine file: ") +
+                engine_path);
+    return false;
+  }
+
+  file.write(static_cast<const char *>(data),
+             static_cast<std::streamsize>(size));
+  if (!file) {
+    log_msg(LOG_WARNING, "engine", "could not write TensorRT engine file");
+    return false;
+  }
+
+  log_msg(LOG_INFO, "engine",
+          std::string("saved TensorRT engine file: ") + engine_path);
+  return true;
+}
+
 } // namespace
 
-Engine buildEngine(const char *onnxPath) {
-  Engine e;
-
+bool build_engine_file(const char *onnx_path, const char *engine_path) {
+  log_msg(LOG_INFO, "engine",
+          std::string("creating TensorRT builder for ") + onnx_path);
   std::unique_ptr<IBuilder> builder{createInferBuilder(logger)};
+  if (!builder) {
+    log_msg(LOG_CRITICAL, "engine", "failed to create TensorRT builder");
+    return false;
+  }
+
   std::unique_ptr<INetworkDefinition> network{builder->createNetworkV2(
       1U << static_cast<uint32_t>(
           NetworkDefinitionCreationFlag::kSTRONGLY_TYPED))};
-  std::unique_ptr<IParser> parser{createParser(*network, logger)};
+  if (!network) {
+    log_msg(LOG_CRITICAL, "engine", "failed to create TensorRT network");
+    return false;
+  }
 
-  parser->parseFromFile(onnxPath,
-                        static_cast<int32_t>(ILogger::Severity::kWARNING));
-  for (int32_t i = 0; i < parser->getNbErrors(); ++i)
-    std::cout << parser->getError(i)->desc() << std::endl;
+  std::unique_ptr<IParser> parser{createParser(*network, logger)};
+  if (!parser) {
+    log_msg(LOG_CRITICAL, "engine", "failed to create ONNX parser");
+    return false;
+  }
+
+  {
+    log_msg(LOG_INFO, "engine", "ONNX parse started");
+    auto start = std::chrono::steady_clock::now();
+    bool parsed = parser->parseFromFile(
+        onnx_path, static_cast<int32_t>(ILogger::Severity::kWARNING));
+    log_duration(LOG_INFO, "engine", "ONNX parse", start);
+
+    for (int32_t i = 0; i < parser->getNbErrors(); ++i)
+      log_msg(LOG_ERROR, "engine", parser->getError(i)->desc());
+
+    if (!parsed || parser->getNbErrors() > 0) {
+      log_msg(LOG_CRITICAL, "engine", "ONNX parse failed");
+      return false;
+    }
+  }
 
   std::unique_ptr<IBuilderConfig> config{builder->createBuilderConfig()};
-  IOptimizationProfile *profile = builder->createOptimizationProfile();
+  if (!config) {
+    log_msg(LOG_CRITICAL, "engine", "failed to create builder config");
+    return false;
+  }
 
+  IOptimizationProfile *profile = builder->createOptimizationProfile();
+  if (!profile) {
+    log_msg(LOG_CRITICAL, "engine", "failed to create optimization profile");
+    return false;
+  }
+
+  log_msg(LOG_INFO, "engine", "configuring optimization profile");
   for (int32_t i = 0; i < network->getNbInputs(); i++) {
     ITensor *input = network->getInput(i);
-    Dims inputDims = input->getDimensions();
-    Dims minDims = inputDims, optDims = inputDims, maxDims = inputDims;
+    Dims input_dims = input->getDimensions();
+    Dims min_dims = input_dims, opt_dims = input_dims, max_dims = input_dims;
 
-    minDims.d[0] = 1;
-    optDims.d[0] = 4;
-    maxDims.d[0] = 16;
-    if (inputDims.nbDims >= 4) {
-      minDims.d[2] = optDims.d[2] = maxDims.d[2] = 640;
-      minDims.d[3] = optDims.d[3] = maxDims.d[3] = 640;
+    min_dims.d[0] = 1;
+    opt_dims.d[0] = 4;
+    max_dims.d[0] = 16;
+    if (input_dims.nbDims >= 4) {
+      min_dims.d[2] = opt_dims.d[2] = max_dims.d[2] = 640;
+      min_dims.d[3] = opt_dims.d[3] = max_dims.d[3] = 640;
     }
 
-    profile->setDimensions(input->getName(), OptProfileSelector::kMIN, minDims);
-    profile->setDimensions(input->getName(), OptProfileSelector::kOPT, optDims);
-    profile->setDimensions(input->getName(), OptProfileSelector::kMAX, maxDims);
+    profile->setDimensions(input->getName(), OptProfileSelector::kMIN,
+                           min_dims);
+    profile->setDimensions(input->getName(), OptProfileSelector::kOPT,
+                           opt_dims);
+    profile->setDimensions(input->getName(), OptProfileSelector::kMAX,
+                           max_dims);
+
+    log_msg(LOG_INFO, "engine",
+            std::string("input profile ") + input->getName() + " min=" +
+                dims_string(min_dims) + " opt=" + dims_string(opt_dims) +
+                " max=" + dims_string(max_dims));
   }
   config->addOptimizationProfile(profile);
 
-  std::unique_ptr<IHostMemory> serializedModel{
-      builder->buildSerializedNetwork(*network, *config)};
+  std::unique_ptr<IHostMemory> serialized_model;
+  {
+    log_msg(LOG_INFO, "engine", "TensorRT serialized network build started");
+    auto start = std::chrono::steady_clock::now();
+    serialized_model.reset(builder->buildSerializedNetwork(*network, *config));
+    log_duration(LOG_INFO, "engine", "TensorRT serialized network build",
+                 start);
+  }
+  if (!serialized_model) {
+    log_msg(LOG_CRITICAL, "engine",
+            "failed to build serialized TensorRT network");
+    return false;
+  }
 
+  return write_engine_file(engine_path, serialized_model->data(),
+                           serialized_model->size());
+}
+
+Engine load_engine(const char *engine_path) {
+  Engine e;
+  std::ifstream file(engine_path, std::ios::binary | std::ios::ate);
+  if (!file) {
+    log_msg(LOG_CRITICAL, "engine",
+            std::string("could not open TensorRT engine file: ") +
+                engine_path);
+    return e;
+  }
+
+  std::streamsize size = file.tellg();
+  if (size <= 0) {
+    log_msg(LOG_CRITICAL, "engine", "TensorRT engine file is empty");
+    return e;
+  }
+
+  std::vector<char> engine_data(static_cast<std::size_t>(size));
+  file.seekg(0, std::ios::beg);
+  if (!file.read(engine_data.data(), size)) {
+    log_msg(LOG_CRITICAL, "engine", "could not read TensorRT engine file");
+    return e;
+  }
+
+  log_msg(LOG_INFO, "engine",
+          "loaded TensorRT engine file bytes=" +
+              std::to_string(engine_data.size()));
+
+  log_msg(LOG_INFO, "engine", "creating TensorRT runtime");
   e.runtime.reset(createInferRuntime(logger));
-  e.engine.reset(e.runtime->deserializeCudaEngine(serializedModel->data(),
-                                                  serializedModel->size()));
-  e.context.reset(e.engine->createExecutionContext());
+  if (!e.runtime) {
+    log_msg(LOG_CRITICAL, "engine", "failed to create TensorRT runtime");
+    return e;
+  }
 
-  for (int32_t i = 0; i < network->getNbInputs(); i++) {
-    ITensor *input = network->getInput(i);
-    Dims dims = input->getDimensions();
+  {
+    log_msg(LOG_INFO, "engine", "TensorRT engine deserialize started");
+    auto start = std::chrono::steady_clock::now();
+    e.engine.reset(
+        e.runtime->deserializeCudaEngine(engine_data.data(), engine_data.size()));
+    log_duration(LOG_INFO, "engine", "TensorRT engine deserialize", start);
+  }
+  if (!e.engine) {
+    log_msg(LOG_CRITICAL, "engine", "failed to deserialize TensorRT engine");
+    return e;
+  }
+
+  log_msg(LOG_INFO, "engine", "creating execution context");
+  e.context.reset(e.engine->createExecutionContext());
+  if (!e.context) {
+    log_msg(LOG_CRITICAL, "engine", "failed to create execution context");
+    return e;
+  }
+
+  for (int32_t i = 0; i < e.engine->getNbIOTensors(); i++) {
+    auto const name = e.engine->getIOTensorName(i);
+    if (e.engine->getTensorIOMode(name) != TensorIOMode::kINPUT)
+      continue;
+
+    Dims dims = e.engine->getTensorShape(name);
     dims.d[0] = 1;
     if (dims.nbDims >= 4) {
       dims.d[2] = 640;
       dims.d[3] = 640;
     }
-    e.context->setInputShape(input->getName(), dims);
+
+    if (!e.context->setInputShape(name, dims)) {
+      log_msg(LOG_CRITICAL, "engine",
+              std::string("failed to set input shape for ") + name);
+      return e;
+    }
+    log_msg(LOG_INFO, "engine",
+            std::string("input shape ") + name + "=" + dims_string(dims));
   }
 
+  log_msg(LOG_INFO, "engine", "allocating tensor buffers");
   e.gpuBuffers.assign(e.engine->getNbIOTensors(), nullptr);
   for (int32_t i = 0; i < e.engine->getNbIOTensors(); i++) {
     auto const name = e.engine->getIOTensorName(i);
@@ -79,9 +301,14 @@ Engine buildEngine(const char *onnxPath) {
     for (int j = 0; j < dims.nbDims; j++)
       elements *= dims.d[j];
     DataType type = e.engine->getTensorDataType(name);
-    std::size_t bytes = elements * elemSize(type);
+    std::size_t bytes = elements * elem_size(type);
     cudaMalloc(&e.gpuBuffers[i], bytes);
     e.context->setTensorAddress(name, e.gpuBuffers[i]);
+
+    log_msg(LOG_INFO, "engine",
+            std::string("tensor ") + name + " shape=" + dims_string(dims) +
+                " type=" + data_type_name(type) +
+                " bytes=" + std::to_string(bytes));
 
     if (e.engine->getTensorIOMode(name) == TensorIOMode::kINPUT) {
       e.inputBuffer = e.gpuBuffers[i];
@@ -93,19 +320,22 @@ Engine buildEngine(const char *onnxPath) {
   }
 
   cudaStreamCreate(&e.stream);
+  log_msg(LOG_INFO, "engine", "CUDA stream created");
+
   return e;
 }
 
-void runInference(Engine &e, const float *cpuInput, float *cpuOutput) {
-  cudaMemcpyAsync(e.inputBuffer, cpuInput, e.inputBytes,
+void run_inference(Engine &e, const float *cpu_input, float *cpu_output) {
+  cudaMemcpyAsync(e.inputBuffer, cpu_input, e.inputBytes,
                   cudaMemcpyHostToDevice, e.stream);
   e.context->enqueueV3(e.stream);
-  cudaMemcpyAsync(cpuOutput, e.outputBuffer, e.outputBytes,
+  cudaMemcpyAsync(cpu_output, e.outputBuffer, e.outputBytes,
                   cudaMemcpyDeviceToHost, e.stream);
   cudaStreamSynchronize(e.stream);
 }
 
-void destroyEngine(Engine &e) {
+void destroy_engine(Engine &e) {
+  log_msg(LOG_INFO, "engine", "destroying TensorRT resources");
   for (void *buf : e.gpuBuffers)
     if (buf)
       cudaFree(buf);

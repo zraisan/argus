@@ -1,19 +1,16 @@
 #include "encoder.hxx"
+#include "ffmpeg_utils.hxx"
+#include "logger.hxx"
 #include "server.hxx"
 
-#include <iostream>
+#include <string>
 
 extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/opt.h>
-#include <libavutil/pixdesc.h>
 }
 
-void print_av_error(const char *where, int err) {
-  char buf[AV_ERROR_MAX_STRING_SIZE] = {};
-  av_strerror(err, buf, sizeof(buf));
-  std::cout << where << ": " << buf << std::endl;
-}
+namespace {
 
 bool supports_pixel_format(const AVCodec *codec, AVPixelFormat pix_fmt) {
   const void *configs = nullptr;
@@ -35,41 +32,60 @@ bool supports_pixel_format(const AVCodec *codec, AVPixelFormat pix_fmt) {
   return false;
 }
 
+bool sane_fps(AVRational fps) {
+  if (fps.num <= 0 || fps.den <= 0)
+    return false;
+
+  double value = av_q2d(fps);
+  return value >= 1.0 && value <= 120.0;
+}
+
 AVRational stream_fps(AVStream *stream) {
-  if (stream && stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0)
+  if (stream && sane_fps(stream->avg_frame_rate))
     return stream->avg_frame_rate;
 
-  if (stream && stream->r_frame_rate.num > 0 && stream->r_frame_rate.den > 0)
+  if (stream && sane_fps(stream->r_frame_rate))
     return stream->r_frame_rate;
 
+  if (stream) {
+    log_msg(LOG_WARNING, "encoder",
+            "using fallback fps 30/1, avg_frame_rate=" +
+                av_rational_string(stream->avg_frame_rate) +
+                " r_frame_rate=" + av_rational_string(stream->r_frame_rate));
+  }
   return AVRational{30, 1};
 }
+
+} // namespace
 
 bool open_encoder(Encoder &e, AVStream *in_stream,
                   AVCodecContext *decoder_codec_ctx) {
   if (!decoder_codec_ctx) {
-    std::cout << "ERROR decoder codec context is null" << std::endl;
+    log_msg(LOG_ERROR, "encoder", "decoder codec context is null");
     return false;
   }
 
+  log_msg(LOG_INFO, "encoder", "finding NVIDIA H.264 encoder h264_nvenc");
   const AVCodec *codec = avcodec_find_encoder_by_name("h264_nvenc");
   if (!codec) {
-    std::cout << "ERROR could not find NVIDIA H.264 encoder h264_nvenc"
-              << std::endl;
+    log_msg(LOG_ERROR, "encoder",
+            "could not find NVIDIA H.264 encoder h264_nvenc");
     return false;
   }
 
   AVPixelFormat pix_fmt = (AVPixelFormat)decoder_codec_ctx->pix_fmt;
   if (!supports_pixel_format(codec, pix_fmt)) {
-    std::cout << "ERROR encoder does not support input pixel format "
-              << av_get_pix_fmt_name(pix_fmt)
-              << ". Convert frames before encoding." << std::endl;
+    log_msg(LOG_ERROR, "encoder",
+            "encoder does not support input pixel format " +
+                av_pixel_format_name(pix_fmt) + ". Convert frames before encoding.");
     return false;
   }
 
+  log_msg(LOG_INFO, "encoder", std::string("allocating encoder context for ") +
+                               codec->name);
   e.codec_ctx = avcodec_alloc_context3(codec);
   if (!e.codec_ctx) {
-    std::cout << "ERROR could not allocate encoder context" << std::endl;
+    log_msg(LOG_ERROR, "encoder", "could not allocate encoder context");
     return false;
   }
 
@@ -87,29 +103,41 @@ bool open_encoder(Encoder &e, AVStream *in_stream,
   e.codec_ctx->gop_size = fps_rounded;
   e.codec_ctx->max_b_frames = 0;
 
+  log_msg(LOG_INFO, "encoder",
+          "config width=" + std::to_string(e.codec_ctx->width) +
+              " height=" + std::to_string(e.codec_ctx->height) +
+              " pix_fmt=" + av_pixel_format_name(e.codec_ctx->pix_fmt) +
+              " fps=" + av_rational_string(fps) +
+              " time_base=" + av_rational_string(e.codec_ctx->time_base) +
+              " bitrate=" + std::to_string(e.codec_ctx->bit_rate) +
+              " gop=" + std::to_string(e.codec_ctx->gop_size) +
+              " max_b_frames=" + std::to_string(e.codec_ctx->max_b_frames));
+
   AVDictionary *opts = nullptr;
   av_dict_set(&opts, "preset", "p1", 0);
   av_dict_set(&opts, "tune", "ull", 0);
   av_dict_set(&opts, "rc", "cbr", 0);
+  log_msg(LOG_INFO, "encoder", "NVENC options preset=p1 tune=ull rc=cbr");
 
-  int ret = avcodec_open2(e.codec_ctx, codec, &opts);
+  int ret = 0;
+  log_msg(LOG_INFO, "encoder", "avcodec_open2 started");
+  ret = avcodec_open2(e.codec_ctx, codec, &opts);
+  log_msg(LOG_INFO, "encoder", "avcodec_open2 finished");
   av_dict_free(&opts);
   if (ret < 0) {
-    print_av_error("ERROR opening encoder", ret);
+    log_av_error(LOG_ERROR, "encoder", "opening encoder failed", ret);
     close_encoder(e);
     return false;
   }
 
   e.packet = av_packet_alloc();
   if (!e.packet) {
-    std::cout << "ERROR could not allocate encoder packet" << std::endl;
+    log_msg(LOG_ERROR, "encoder", "could not allocate encoder packet");
     close_encoder(e);
     return false;
   }
 
-  std::cout << "Encoder opened: " << codec->name << " "
-            << e.codec_ctx->width << "x" << e.codec_ctx->height << " fps "
-            << fps.num << "/" << fps.den << std::endl;
+  log_msg(LOG_INFO, "encoder", std::string("encoder opened: ") + codec->name);
   return true;
 }
 
@@ -121,7 +149,7 @@ bool serve_stream(Encoder &e, Server &s, AVFrame *frame) {
 
   int ret = avcodec_send_frame(e.codec_ctx, frame);
   if (ret < 0) {
-    print_av_error("ERROR sending frame to encoder", ret);
+    log_av_error(LOG_ERROR, "encoder", "sending frame to encoder failed", ret);
     return false;
   }
 
@@ -130,7 +158,7 @@ bool serve_stream(Encoder &e, Server &s, AVFrame *frame) {
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
       return true;
     if (ret < 0) {
-      print_av_error("ERROR receiving packet from encoder", ret);
+      log_av_error(LOG_ERROR, "encoder", "receiving packet from encoder failed", ret);
       return false;
     }
 
@@ -145,7 +173,7 @@ bool flush_encoder(Encoder &e, Server &s) {
 
   int ret = avcodec_send_frame(e.codec_ctx, nullptr);
   if (ret < 0) {
-    print_av_error("ERROR sending flush to encoder", ret);
+    log_av_error(LOG_ERROR, "encoder", "sending flush to encoder failed", ret);
     return false;
   }
 
@@ -154,7 +182,7 @@ bool flush_encoder(Encoder &e, Server &s) {
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
       return true;
     if (ret < 0) {
-      print_av_error("ERROR flushing encoder", ret);
+      log_av_error(LOG_ERROR, "encoder", "flushing encoder failed", ret);
       return false;
     }
 
@@ -164,6 +192,7 @@ bool flush_encoder(Encoder &e, Server &s) {
 }
 
 void close_encoder(Encoder &e) {
+  log_msg(LOG_INFO, "encoder", "closing encoder");
   if (e.packet)
     av_packet_free(&e.packet);
   if (e.codec_ctx)

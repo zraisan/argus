@@ -18,6 +18,7 @@ struct Engine {
   cudaStream_t stream = nullptr;
 };
 
-Engine buildEngine(const char *onnxPath);
-void runInference(Engine &e, const float *cpuInput, float *cpuOutput);
-void destroyEngine(Engine &e);
+bool build_engine_file(const char *onnx_path, const char *engine_path);
+Engine load_engine(const char *engine_path);
+void run_inference(Engine &e, const float *cpu_input, float *cpu_output);
+void destroy_engine(Engine &e);

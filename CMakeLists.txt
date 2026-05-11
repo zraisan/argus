@@ -17,12 +17,14 @@ target_sources(argus
     src/server.cxx
     src/preprocess.cxx
     src/postprocess.cxx
-    utils/cuda.cxx
+    utils/ffmpeg_utils.cxx
+    utils/logger.cxx
 )
 
 target_include_directories(argus
   PRIVATE
     utils
+    third_party/cxxopts
 )
 
 find_package(PkgConfig REQUIRED)

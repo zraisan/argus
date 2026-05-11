@@ -81,10 +81,21 @@ cmake -B build
 cmake --build build
 ```
 
-Run the executable:
+Build a TensorRT engine file:
 
 ```bash
-./build/argus
+./build/argus --build \
+  --model input/models/yolov8n.onnx \
+  --engine output/yolov8n.engine
+```
+
+Run the RTSP pipeline from an existing engine file:
+
+```bash
+./build/argus \
+  --engine output/yolov8n.engine \
+  --input rtsp://source \
+  --output rtsp://localhost:8554/argus
 ```
 
 ## RTSP Output
@@ -118,7 +129,11 @@ src/
   main.cxx       Pipeline wiring
 
 utils/
-  cuda.*         CUDA helper utilities
+  ffmpeg_utils.* FFmpeg error helpers
+  logger.*       timestamped logging
+
+third_party/
+  cxxopts/       command line option parsing
 ```
 
 ## Development Notes
@@ -147,7 +162,7 @@ Contributions are welcome.
 
 1. Add robust pixel-format conversion for CUDA, NV12, and YUV420P frames.
 2. Move preprocessing and drawing closer to the GPU path where appropriate.
-3. Make input and output RTSP URLs configurable.
+3. Add multi-input stream support.
 4. Add structured logging for FFmpeg and TensorRT errors.
 5. Add small integration tests for decoder, encoder, and muxer setup.
 
