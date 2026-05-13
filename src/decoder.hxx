@@ -13,6 +13,6 @@ struct Decoder {
   int videoStreamIndex = -1;
 };
 
-bool openStream(Decoder &d, const char *url);
+bool openStream(Decoder &d, const char *url, const char *rtsp_transport);
 bool nextFrame(Decoder &d);
 void closeStream(Decoder &d);

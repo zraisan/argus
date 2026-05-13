@@ -19,6 +19,18 @@ with NVIDIA NVENC, and publishes the processed stream to an RTSP endpoint.
 The project is currently focused on learning and building the full video path
 step by step.
 
+## Demo
+
+<p align="center">
+  <video src="docs/assets/argus_vtest_demo.mp4" controls autoplay muted loop playsinline width="100%"></video>
+</p>
+
+[Watch the demo video](docs/assets/argus_vtest_demo.mp4)
+
+The demo uses OpenCV's `vtest.avi` sample as an RTSP source relayed through
+MediaMTX. The processed output shows YOLO detections drawn on the live stream
+and re-published through RTSP.
+
 ## Features
 
 - **RTSP Input**: Opens live RTSP video through FFmpeg/libav
@@ -32,6 +44,8 @@ step by step.
 
 ## Pipeline
 
+<div align="center">
+
 ```mermaid
 flowchart TD
     input[RTSP input] --> decoder[FFmpeg decoder]
@@ -44,6 +58,8 @@ flowchart TD
     encoder --> server[RTSP publisher]
     server --> output[RTSP output]
 ```
+
+</div>
 
 ## Requirements
 
@@ -81,22 +97,25 @@ cmake -B build
 cmake --build build
 ```
 
-Build a TensorRT engine file:
+After exporting the YOLO ONNX model, build a TensorRT engine file:
 
 ```bash
 ./build/argus --build \
-  --model input/models/yolov8n.onnx \
-  --engine output/yolov8n.engine
+  --model input/models/yolov8n_dynamic_simplify.onnx \
+  --engine output/yolov8n_dynamic_simplify.engine
 ```
 
 Run the RTSP pipeline from an existing engine file:
 
 ```bash
 ./build/argus \
-  --engine output/yolov8n.engine \
+  --engine output/yolov8n_dynamic_simplify.engine \
   --input rtsp://source \
+  --rtsp-transport tcp \
   --output rtsp://localhost:8554/argus
 ```
+
+Use `--rtsp-transport udp` for sources that reject TCP interleaved RTSP.
 
 ## RTSP Output
 
@@ -136,13 +155,31 @@ libs/
   cxxopts.hpp    command line option parsing
 ```
 
+## Model Export
+
+The current postprocess path expects a YOLO ONNX model with NMS included and an
+output tensor shaped like:
+
+```text
+[batch, 300, 6]
+```
+
+For Ultralytics YOLOv8, export with:
+
+```bash
+yolo export model=yolov8n.pt format=onnx imgsz=640 opset=17 dynamic=True nms=True simplify=True
+```
+
+The `simplify=True` export has been tested with TensorRT. The non-simplified
+NMS graph can build but fail at inference in TensorRT shape calculation.
+
 ## Development Notes
 
-The current frame overlay code writes directly into planar YUV frame buffers.
-That matches `yuv420p` style frames, but not every pixel format. If the NVIDIA
-decode path produces frames in a different format, the frame must be converted
-before drawing and encoding, or the drawing path must be updated for that
-format.
+The frame overlay code writes directly into decoded YUV buffers. It currently
+supports `nv12`, `yuv420p`, and `yuvj420p`. The NVIDIA CUVID H.264 path commonly
+outputs `nv12`. If a stream decodes to another pixel format, the frame must be
+converted before drawing and encoding, or the drawing path must be updated for
+that format.
 
 The encoder and RTSP publisher are separated:
 
@@ -160,11 +197,12 @@ Contributions are welcome.
 
 ### Areas to Improve
 
-1. Add robust pixel-format conversion for CUDA, NV12, and YUV420P frames.
-2. Move preprocessing and drawing closer to the GPU path where appropriate.
+1. Improve runtime performance.
+2. Add AMD GPU support through ROCm.
 3. Add multi-input stream support.
-4. Add structured logging for FFmpeg and TensorRT errors.
-5. Add small integration tests for decoder, encoder, and muxer setup.
+4. Add support for non-RTSP input stream types such as files, HTTP, HLS, and webcams.
+5. Add structured logging for FFmpeg and TensorRT errors.
+6. Add small integration tests for decoder, encoder, and muxer setup.
 
 ### Style
 

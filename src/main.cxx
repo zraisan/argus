@@ -18,6 +18,7 @@ struct AppConfig {
   std::string engine_path = "output/yolov8n.engine";
   std::vector<std::string> input_urls;
   std::string output_url = "rtsp://localhost:8554/argus";
+  std::string rtsp_transport = "tcp";
 };
 
 bool parse_args(int argc, char **argv, AppConfig &config) {
@@ -35,6 +36,9 @@ bool parse_args(int argc, char **argv, AppConfig &config) {
       ("output", "Output RTSP URL",
        cxxopts::value<std::string>(config.output_url)
            ->default_value(config.output_url))
+      ("rtsp-transport", "Input RTSP transport: tcp or udp",
+       cxxopts::value<std::string>(config.rtsp_transport)
+           ->default_value(config.rtsp_transport))
       ("h,help", "Show help");
 
   try {
@@ -49,6 +53,12 @@ bool parse_args(int argc, char **argv, AppConfig &config) {
 
     if (!config.build && config.input_urls.size() != 1) {
       std::cerr << "run mode requires exactly one --input URL" << std::endl;
+      std::cout << options.help() << std::endl;
+      return false;
+    }
+
+    if (config.rtsp_transport != "tcp" && config.rtsp_transport != "udp") {
+      std::cerr << "--rtsp-transport must be tcp or udp" << std::endl;
       std::cout << options.help() << std::endl;
       return false;
     }
@@ -83,6 +93,8 @@ int main(int argc, char **argv) {
   const std::string &input_url = config.input_urls[0];
   log_msg(LOG_INFO, "main", std::string("input: ") + input_url);
   log_msg(LOG_INFO, "main", std::string("output: ") + config.output_url);
+  log_msg(LOG_INFO, "main",
+          std::string("RTSP input transport: ") + config.rtsp_transport);
 
   Engine engine;
   log_msg(LOG_INFO, "main", "TensorRT engine load started");
@@ -97,7 +109,7 @@ int main(int argc, char **argv) {
 
   Decoder decoder;
   log_msg(LOG_INFO, "main", "RTSP input open started");
-  if (!openStream(decoder, input_url.c_str())) {
+  if (!openStream(decoder, input_url.c_str(), config.rtsp_transport.c_str())) {
     destroy_engine(engine);
     return -1;
   }

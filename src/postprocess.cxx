@@ -5,6 +5,7 @@
 
 extern "C" {
 #include <libavutil/frame.h>
+#include <libavutil/pixfmt.h>
 }
 
 namespace {
@@ -60,22 +61,31 @@ const YuvColor &colorForClass(int classId) {
   return palette[classId % kPaletteSize];
 }
 
-void setYUVPixel(AVFrame *frame, int x, int y, const YuvColor &c) {
+void setYuv420pPixel(AVFrame *frame, int x, int y, const YuvColor &c) {
   frame->data[0][y * frame->linesize[0] + x] = c.y;
   frame->data[1][(y >> 1) * frame->linesize[1] + (x >> 1)] = c.u;
   frame->data[2][(y >> 1) * frame->linesize[2] + (x >> 1)] = c.v;
 }
 
-void drawBoxYUV(AVFrame *frame, int x1, int y1, int x2, int y2,
-                const YuvColor &color, int thickness = 2) {
+void setNv12Pixel(AVFrame *frame, int x, int y, const YuvColor &c) {
+  frame->data[0][y * frame->linesize[0] + x] = c.y;
+
+  uint8_t *uv = frame->data[1] + (y >> 1) * frame->linesize[1] + (x & ~1);
+  uv[0] = c.u;
+  uv[1] = c.v;
+}
+
+template <typename SetPixel>
+void drawBox(AVFrame *frame, int x1, int y1, int x2, int y2,
+             const YuvColor &color, SetPixel set_pixel, int thickness = 2) {
   for (int t = 0; t < thickness; t++) {
     for (int x = x1; x <= x2; x++) {
-      setYUVPixel(frame, x, y1 + t, color); // top
-      setYUVPixel(frame, x, y2 - t, color); // bottom
+      set_pixel(frame, x, y1 + t, color); // top
+      set_pixel(frame, x, y2 - t, color); // bottom
     }
     for (int y = y1; y <= y2; y++) {
-      setYUVPixel(frame, x1 + t, y, color); // left
-      setYUVPixel(frame, x2 - t, y, color); // right
+      set_pixel(frame, x1 + t, y, color); // left
+      set_pixel(frame, x2 - t, y, color); // right
     }
   }
 }
@@ -83,7 +93,9 @@ void drawBoxYUV(AVFrame *frame, int x1, int y1, int x2, int y2,
 } // namespace
 
 void draw_box(const std::vector<Detection> &dets, AVFrame *frame) {
-  av_frame_make_writable(frame);
+  if (av_frame_make_writable(frame) < 0)
+    return;
+
   int width = frame->width;
   int height = frame->height;
   for (const auto &d : dets) {
@@ -93,6 +105,12 @@ void draw_box(const std::vector<Detection> &dets, AVFrame *frame) {
     int iy2 = std::clamp((int)d.y2, 0, height - 1);
     if (ix2 <= ix1 || iy2 <= iy1)
       continue;
-    drawBoxYUV(frame, ix1, iy1, ix2, iy2, colorForClass(d.classId));
+
+    const YuvColor &color = colorForClass(d.classId);
+    if (frame->format == AV_PIX_FMT_NV12)
+      drawBox(frame, ix1, iy1, ix2, iy2, color, setNv12Pixel);
+    else if (frame->format == AV_PIX_FMT_YUV420P ||
+             frame->format == AV_PIX_FMT_YUVJ420P)
+      drawBox(frame, ix1, iy1, ix2, iy2, color, setYuv420pPixel);
   }
 }

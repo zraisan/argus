@@ -3,6 +3,10 @@
 #include "logger.hxx"
 #include <string>
 
+extern "C" {
+#include <libavutil/dict.h>
+}
+
 namespace {
 
 const char *nvidia_decoder_name(AVCodecID codec_id) {
@@ -32,7 +36,7 @@ const char *nvidia_decoder_name(AVCodecID codec_id) {
 
 } // namespace
 
-bool openStream(Decoder &d, const char *url) {
+bool openStream(Decoder &d, const char *url, const char *rtsp_transport) {
   log_msg(LOG_INFO, "decoder", std::string("allocating format context for ") + url);
   d.formatCtx = avformat_alloc_context();
   if (!d.formatCtx) {
@@ -41,8 +45,14 @@ bool openStream(Decoder &d, const char *url) {
   }
 
   int ret = 0;
+  AVDictionary *options = nullptr;
+  av_dict_set(&options, "rtsp_transport", rtsp_transport, 0);
+  log_msg(LOG_INFO, "decoder",
+          std::string("RTSP input transport: ") + rtsp_transport);
+
   log_msg(LOG_INFO, "decoder", "avformat_open_input started");
-  ret = avformat_open_input(&d.formatCtx, url, nullptr, nullptr);
+  ret = avformat_open_input(&d.formatCtx, url, nullptr, &options);
+  av_dict_free(&options);
   log_msg(LOG_INFO, "decoder", "avformat_open_input finished");
   if (ret < 0) {
     log_av_error(LOG_ERROR, "decoder", "could not open input stream", ret);
