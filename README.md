@@ -22,10 +22,8 @@ step by step.
 ## Demo
 
 <p align="center">
-  <video src="docs/assets/argus_vtest_demo.mp4" controls autoplay muted loop playsinline width="100%"></video>
+  <img src="docs/assets/argus_vtest_demo.gif" alt="argus RTSP YOLO demo" width="100%">
 </p>
-
-[Watch the demo video](docs/assets/argus_vtest_demo.mp4)
 
 The demo uses OpenCV's `vtest.avi` sample as an RTSP source relayed through
 MediaMTX. The processed output shows YOLO detections drawn on the live stream
