@@ -1,8 +1,8 @@
 #include "decoder.hxx"
-#include "ffmpeg_utils.hxx"
 #include "logger.hxx"
+#include "streams.hxx"
+#include <memory>
 #include <string>
-
 extern "C" {
 #include <libavutil/dict.h>
 }
@@ -37,21 +37,59 @@ const char *nvidia_decoder_name(AVCodecID codec_id) {
 } // namespace
 
 bool openStream(Decoder &d, const char *url, const char *rtsp_transport) {
-  log_msg(LOG_INFO, "decoder", std::string("allocating format context for ") + url);
+  log_msg(LOG_INFO, "decoder",
+          std::string("allocating format context for ") + url);
   d.formatCtx = avformat_alloc_context();
   if (!d.formatCtx) {
     log_msg(LOG_ERROR, "decoder", "could not allocate format context");
     return false;
   }
 
-  int ret = 0;
+  StreamType type = stream_type_from_url(url);
+  d.type = type;
+
   AVDictionary *options = nullptr;
-  av_dict_set(&options, "rtsp_transport", rtsp_transport, 0);
-  log_msg(LOG_INFO, "decoder",
-          std::string("RTSP input transport: ") + rtsp_transport);
+  if (type == StreamType::Rtsp) {
+    av_dict_set(&options, "rtsp_transport", rtsp_transport, 0);
+    log_msg(LOG_INFO, "decoder",
+            std::string("RTSP input transport: ") + rtsp_transport);
+  } else if (type == StreamType::Hls) {
+    av_dict_set(&options, "rw_timeout", "10000000",
+                0);                             // 10s network I/O timeout
+    av_dict_set(&options, "reconnect", "1", 0); // reconnect before EOF
+    av_dict_set(&options, "reconnect_streamed", "1",
+                0); // reconnect live streams
+    av_dict_set(&options, "reconnect_on_network_error", "1",
+                0); // retry network errors
+    av_dict_set(&options, "reconnect_delay_max", "5",
+                0); // cap retry delay at 5s
+    av_dict_set(&options, "user_agent", "Mozilla/5.0",
+                0); // avoid default FFmpeg UA blocks
+
+    av_dict_set(&options, "live_start_index", "-1", 0); // start near live edge
+    av_dict_set(&options, "http_persistent", "1", 0); // reuse HTTP connections
+    av_dict_set(&options, "http_multiple", "1",
+                0); // allow parallel HTTP fetches
+    av_dict_set(&options, "seg_max_retry", "3", 0); // retry failed HLS segments
+  } else if (type == StreamType::Webrtc) {
+    av_dict_set(&options, "rw_timeout", "10000000",
+                0);                             // 10s network I/O timeout
+    av_dict_set(&options, "reconnect", "1", 0); // reconnect before EOF
+    av_dict_set(&options, "reconnect_streamed", "1",
+                0); // reconnect live streams
+    av_dict_set(&options, "reconnect_on_network_error", "1",
+                0); // retry network errors
+    av_dict_set(&options, "reconnect_delay_max", "5",
+                0); // cap retry delay at 5s
+    av_dict_set(&options, "user_agent", "Mozilla/5.0",
+                0); // avoid default FFmpeg UA blocks
+
+    log_msg(LOG_WARNING, "decoder",
+            "WebRTC input requires FFmpeg WebRTC/WHEP demuxer support");
+  }
 
   log_msg(LOG_INFO, "decoder", "avformat_open_input started");
-  ret = avformat_open_input(&d.formatCtx, url, nullptr, &options);
+  int ret = avformat_open_input(&d.formatCtx, url, nullptr, &options);
   av_dict_free(&options);
   log_msg(LOG_INFO, "decoder", "avformat_open_input finished");
   if (ret < 0) {
@@ -89,8 +127,8 @@ bool openStream(Decoder &d, const char *url, const char *rtsp_transport) {
                   " codec=" + (codec ? codec->name : "(unknown)") +
                   " codec_id=" + std::to_string(p->codec_id) +
                   " resolution=" + std::to_string(p->width) + "x" +
-                  std::to_string(p->height) +
-                  " avg_frame_rate=" + av_rational_string(stream->avg_frame_rate) +
+                  std::to_string(p->height) + " avg_frame_rate=" +
+                  av_rational_string(stream->avg_frame_rate) +
                   " r_frame_rate=" + av_rational_string(stream->r_frame_rate) +
                   " time_base=" + av_rational_string(stream->time_base));
       break;
@@ -98,7 +136,8 @@ bool openStream(Decoder &d, const char *url, const char *rtsp_transport) {
   }
 
   if (d.videoStreamIndex == -1 || !codec) {
-    log_msg(LOG_ERROR, "decoder", "stream does not contain a supported video stream");
+    log_msg(LOG_ERROR, "decoder",
+            "stream does not contain a supported video stream");
     return false;
   }
 
@@ -178,7 +217,8 @@ bool nextFrame(Decoder &d) {
 
   int flush_ret = avcodec_send_packet(d.codecCtx, nullptr);
   if (flush_ret < 0 && flush_ret != AVERROR_EOF)
-    log_av_error(LOG_WARNING, "decoder", "decoder flush send failed", flush_ret);
+    log_av_error(LOG_WARNING, "decoder", "decoder flush send failed",
+                 flush_ret);
 
   r = avcodec_receive_frame(d.codecCtx, d.frame);
   if (r == 0)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "streams.hxx"
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -11,6 +12,7 @@ struct Decoder {
   AVFrame *frame = nullptr;
   AVPacket *packet = nullptr;
   int videoStreamIndex = -1;
+  StreamType type = StreamType::Unknown;
 };
 
 bool openStream(Decoder &d, const char *url, const char *rtsp_transport);

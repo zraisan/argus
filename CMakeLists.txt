@@ -17,7 +17,7 @@ target_sources(argus
     src/server.cxx
     src/preprocess.cxx
     src/postprocess.cxx
-    utils/ffmpeg_utils.cxx
+    utils/streams.cxx
     utils/logger.cxx
 )
 

@@ -146,7 +146,7 @@ src/
   main.cxx       Pipeline wiring
 
 utils/
-  ffmpeg_utils.* FFmpeg error helpers
+  streams.*      stream and FFmpeg helpers
   logger.*       timestamped logging
 
 libs/
