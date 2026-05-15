@@ -2,7 +2,7 @@
 
 # argus
 
-**TensorRT YOLO Live Object Detection for RTSP Streams**
+**TensorRT YOLO Live Object Detection for Video Streams**
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 [![C++](https://img.shields.io/badge/C%2B%2B-20-00599C.svg?logo=cplusplus)](https://en.cppreference.com/w/cpp/20)
@@ -11,10 +11,10 @@
 
 </div>
 
-argus is a C++ live object detection pipeline for RTSP video. It decodes an
-input stream with FFmpeg/libav, preprocesses frames for YOLO, runs inference
-with TensorRT, draws bounding boxes on the decoded frame, encodes the result
-with NVIDIA NVENC, and publishes the processed stream to an RTSP endpoint.
+argus is a C++ live object detection pipeline for video streams. It decodes an
+input with FFmpeg/libav, preprocesses frames for YOLO, runs inference with
+TensorRT, draws bounding boxes on the decoded frame, encodes the result with
+NVIDIA NVENC, and writes the processed video to a stream output.
 
 The project is currently focused on learning and building the full video path
 step by step.
@@ -31,14 +31,14 @@ and re-published through RTSP.
 
 ## Features
 
-- **RTSP Input**: Opens live RTSP video through FFmpeg/libav
+- **Stream Input**: Opens video inputs through FFmpeg/libav, including RTSP, HLS, HTTP media, and local files
 - **NVIDIA Decode Path**: Prefers CUVID decoders such as `h264_cuvid` when the input codec supports them
 - **TensorRT Inference**: Builds and runs a TensorRT engine from a YOLO ONNX model
 - **Frame Preprocessing**: Converts decoded frames into the RGB tensor layout expected by the model
 - **Postprocessing**: Converts model output into detection boxes in source-frame coordinates
 - **Bounding Box Overlay**: Draws detections directly onto the local decoded video frame
 - **NVIDIA Encoding**: Encodes processed frames through `h264_nvenc`
-- **RTSP Publishing**: Writes encoded packets to an RTSP output URL through FFmpeg/libav
+- **Stream Output**: Writes encoded packets to RTSP, HLS, MP4, MPEG-TS, or Matroska outputs through FFmpeg/libav
 
 ## Pipeline
 
@@ -46,15 +46,15 @@ and re-published through RTSP.
 
 ```mermaid
 flowchart TD
-    input[RTSP input] --> decoder[FFmpeg decoder]
+    input[Stream input] --> decoder[FFmpeg decoder]
     decoder --> frame[AVFrame]
     frame --> preprocess[Preprocess]
     preprocess --> trt[TensorRT YOLO]
     trt --> postprocess[Postprocess detections]
     postprocess --> draw[Draw bounding boxes]
     draw --> encoder[NVIDIA H.264 encoder]
-    encoder --> server[RTSP publisher]
-    server --> output[RTSP output]
+    encoder --> server[FFmpeg muxer]
+    server --> output[Stream output]
 ```
 
 </div>
@@ -71,7 +71,7 @@ flowchart TD
   - `libavcodec`
   - `libswscale`
   - `libavutil`
-- An RTSP server for publishing output, such as MediaMTX
+- An RTSP server for RTSP output, such as MediaMTX
 
 The current encoder path expects FFmpeg to provide:
 
@@ -103,7 +103,7 @@ After exporting the YOLO ONNX model, build a TensorRT engine file:
   --engine output/yolov8n_dynamic_simplify.engine
 ```
 
-Run the RTSP pipeline from an existing engine file:
+Run the pipeline from an existing engine file:
 
 ```bash
 ./build/argus \
@@ -115,9 +115,20 @@ Run the RTSP pipeline from an existing engine file:
 
 Use `--rtsp-transport udp` for sources that reject TCP interleaved RTSP.
 
-## RTSP Output
+## Output
 
-argus publishes to:
+The output type is selected from the `--output` URL:
+
+```text
+rtsp://localhost:8554/argus  RTSP
+output/argus.m3u8            HLS
+output/argus.mp4             MP4
+output/argus.ts              MPEG-TS
+output/argus.mkv             Matroska
+output/argus.webm            WebM
+```
+
+For RTSP output, argus publishes to:
 
 ```text
 rtsp://localhost:8554/argus
@@ -133,16 +144,31 @@ With MediaMTX running locally, viewers can open:
 rtsp://localhost:8554/argus
 ```
 
+For HLS output, argus writes a playlist and segment files:
+
+```bash
+./build/argus \
+  --engine output/yolov8n_dynamic_simplify.engine \
+  --input rtsp://source \
+  --output output/argus.m3u8
+```
+
+The generated playlist can be checked with:
+
+```bash
+ffprobe output/argus.m3u8
+```
+
 ## Source Layout
 
 ```text
 src/
-  decoder.*      RTSP input and packet-to-frame decoding
+  decoder.*      input stream and packet-to-frame decoding
   preprocess.*   Frame conversion for YOLO input
   engine.*       TensorRT engine build and inference
   postprocess.*  Detection parsing and bounding box drawing
   encoder.*      AVFrame-to-H.264 packet encoding
-  server.*       RTSP output muxing and packet writing
+  server.*       output muxing and packet writing
   main.cxx       Pipeline wiring
 
 utils/
@@ -179,11 +205,11 @@ outputs `nv12`. If a stream decodes to another pixel format, the frame must be
 converted before drawing and encoding, or the drawing path must be updated for
 that format.
 
-The encoder and RTSP publisher are separated:
+The encoder and output muxer are separated:
 
 ```text
 encoder = raw AVFrame to compressed AVPacket
-server  = compressed AVPacket to RTSP output
+server  = compressed AVPacket to stream output
 ```
 
 This separation keeps the video compression step independent from the output
@@ -198,7 +224,7 @@ Contributions are welcome.
 1. Improve runtime performance.
 2. Add AMD GPU support through ROCm.
 3. Add multi-input stream support.
-4. Add support for non-RTSP input stream types such as files, HTTP, HLS, and webcams.
+4. Expand stream input and output coverage, including webcams and additional network protocols.
 5. Add structured logging for FFmpeg and TensorRT errors.
 6. Add small integration tests for decoder, encoder, and muxer setup.
 
