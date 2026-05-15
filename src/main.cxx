@@ -22,7 +22,7 @@ struct AppConfig {
 };
 
 bool parse_args(int argc, char **argv, AppConfig &config) {
-  cxxopts::Options options("argus", "TensorRT YOLO RTSP pipeline");
+  cxxopts::Options options("argus", "TensorRT YOLO live video pipeline");
   options.add_options()
       ("build", "Build the TensorRT engine file and exit")
       ("model", "ONNX model path",
@@ -31,9 +31,9 @@ bool parse_args(int argc, char **argv, AppConfig &config) {
       ("engine", "TensorRT engine path",
        cxxopts::value<std::string>(config.engine_path)
            ->default_value(config.engine_path))
-      ("input", "Input RTSP URL",
+      ("input", "Input stream URL",
        cxxopts::value<std::vector<std::string>>(config.input_urls))
-      ("output", "Output RTSP URL",
+      ("output", "Output stream URL",
        cxxopts::value<std::string>(config.output_url)
            ->default_value(config.output_url))
       ("rtsp-transport", "Input RTSP transport: tcp or udp",
@@ -94,7 +94,7 @@ int main(int argc, char **argv) {
   log_msg(LOG_INFO, "main", std::string("input: ") + input_url);
   log_msg(LOG_INFO, "main", std::string("output: ") + config.output_url);
   log_msg(LOG_INFO, "main",
-          std::string("RTSP input transport: ") + config.rtsp_transport);
+          std::string("input RTSP transport: ") + config.rtsp_transport);
 
   Engine engine;
   log_msg(LOG_INFO, "main", "TensorRT engine load started");
@@ -108,12 +108,12 @@ int main(int argc, char **argv) {
   }
 
   Decoder decoder;
-  log_msg(LOG_INFO, "main", "RTSP input open started");
+  log_msg(LOG_INFO, "main", "input stream open started");
   if (!openStream(decoder, input_url.c_str(), config.rtsp_transport.c_str())) {
     destroy_engine(engine);
     return -1;
   }
-  log_msg(LOG_INFO, "main", "RTSP input open finished");
+  log_msg(LOG_INFO, "main", "input stream open finished");
 
   Preprocessor pre;
   log_msg(LOG_INFO, "main", "preprocess setup started");
@@ -141,7 +141,7 @@ int main(int argc, char **argv) {
   log_msg(LOG_INFO, "main", "encoder setup finished");
 
   Server server;
-  log_msg(LOG_INFO, "main", "RTSP output publish started");
+  log_msg(LOG_INFO, "main", "output stream setup started");
   if (!open_server(server, config.output_url.c_str(), encoder.codec_ctx)) {
     close_encoder(encoder);
     destroyPreprocess(pre);
@@ -149,7 +149,7 @@ int main(int argc, char **argv) {
     destroy_engine(engine);
     return -1;
   }
-  log_msg(LOG_INFO, "main", "RTSP output publish finished");
+  log_msg(LOG_INFO, "main", "output stream setup finished");
 
   log_msg(LOG_INFO, "main", "frame processing loop started");
   int64_t frame_count = 0;

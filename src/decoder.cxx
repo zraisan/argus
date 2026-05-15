@@ -86,6 +86,18 @@ bool openStream(Decoder &d, const char *url, const char *rtsp_transport) {
 
     log_msg(LOG_WARNING, "decoder",
             "WebRTC input requires FFmpeg WebRTC/WHEP demuxer support");
+  } else if (type == StreamType::Http) {
+    av_dict_set(&options, "rw_timeout", "10000000",
+                0);                             // 10s network I/O timeout
+    av_dict_set(&options, "reconnect", "1", 0); // reconnect before EOF
+    av_dict_set(&options, "reconnect_streamed", "1",
+                0); // reconnect live streams
+    av_dict_set(&options, "reconnect_on_network_error", "1",
+                0); // retry network errors
+    av_dict_set(&options, "reconnect_delay_max", "5",
+                0); // cap retry delay at 5s
+    av_dict_set(&options, "user_agent", "Mozilla/5.0",
+                0); // avoid default FFmpeg UA blocks
   }
 
   log_msg(LOG_INFO, "decoder", "avformat_open_input started");
