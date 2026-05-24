@@ -1,7 +1,6 @@
 #include "decoder.hxx"
 #include "logger.hxx"
 #include "streams.hxx"
-#include <memory>
 #include <string>
 extern "C" {
 #include <libavutil/dict.h>
@@ -36,7 +35,7 @@ const char *nvidia_decoder_name(AVCodecID codec_id) {
 
 } // namespace
 
-bool openStream(Decoder &d, const char *url, const char *rtsp_transport) {
+bool openStream(Decoder &d, const char *url) {
   log_msg(LOG_INFO, "decoder",
           std::string("allocating format context for ") + url);
   d.formatCtx = avformat_alloc_context();
@@ -50,9 +49,8 @@ bool openStream(Decoder &d, const char *url, const char *rtsp_transport) {
 
   AVDictionary *options = nullptr;
   if (type == StreamType::Rtsp) {
-    av_dict_set(&options, "rtsp_transport", rtsp_transport, 0);
-    log_msg(LOG_INFO, "decoder",
-            std::string("RTSP input transport: ") + rtsp_transport);
+    av_dict_set(&options, "rtsp_transport", "tcp", 0);
+    log_msg(LOG_INFO, "decoder", "RTSP input transport: tcp");
   } else if (type == StreamType::Hls) {
     av_dict_set(&options, "rw_timeout", "10000000",
                 0);                             // 10s network I/O timeout

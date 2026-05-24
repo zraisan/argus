@@ -1,10 +1,12 @@
 #include "engine.hxx"
 #include "NvOnnxParser.h"
 #include "logger.hxx"
+#include "preprocess.hxx"
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <vector>
 
@@ -218,13 +220,12 @@ bool build_engine_file(const char *onnx_path, const char *engine_path) {
                            serialized_model->size());
 }
 
-Engine load_engine(const char *engine_path) {
+Engine load_engine(const char *engine_path, int batch_size) {
   Engine e;
   std::ifstream file(engine_path, std::ios::binary | std::ios::ate);
   if (!file) {
     log_msg(LOG_CRITICAL, "engine",
-            std::string("could not open TensorRT engine file: ") +
-                engine_path);
+            std::string("could not open TensorRT engine file: ") + engine_path);
     return e;
   }
 
@@ -255,8 +256,8 @@ Engine load_engine(const char *engine_path) {
   {
     log_msg(LOG_INFO, "engine", "TensorRT engine deserialize started");
     auto start = std::chrono::steady_clock::now();
-    e.engine.reset(
-        e.runtime->deserializeCudaEngine(engine_data.data(), engine_data.size()));
+    e.engine.reset(e.runtime->deserializeCudaEngine(engine_data.data(),
+                                                    engine_data.size()));
     log_duration(LOG_INFO, "engine", "TensorRT engine deserialize", start);
   }
   if (!e.engine) {
@@ -277,7 +278,7 @@ Engine load_engine(const char *engine_path) {
       continue;
 
     Dims dims = e.engine->getTensorShape(name);
-    dims.d[0] = 1;
+    dims.d[0] = batch_size;
     if (dims.nbDims >= 4) {
       dims.d[2] = 640;
       dims.d[3] = 640;
@@ -311,11 +312,15 @@ Engine load_engine(const char *engine_path) {
                 " bytes=" + std::to_string(bytes));
 
     if (e.engine->getTensorIOMode(name) == TensorIOMode::kINPUT) {
+      e.inputName = name;
       e.inputBuffer = e.gpuBuffers[i];
       e.inputBytes = bytes;
+      e.inputElementsPerFrame = elements / batch_size;
     } else {
+      e.outputName = name;
       e.outputBuffer = e.gpuBuffers[i];
       e.outputBytes = bytes;
+      e.outputElementsPerFrame = elements / batch_size;
     }
   }
 
@@ -325,13 +330,36 @@ Engine load_engine(const char *engine_path) {
   return e;
 }
 
-void run_inference(Engine &e, const float *cpu_input, float *cpu_output) {
-  cudaMemcpyAsync(e.inputBuffer, cpu_input, e.inputBytes,
-                  cudaMemcpyHostToDevice, e.stream);
+std::unique_ptr<float[]> run_inference(Engine &e, const float *cpu_input,
+                                       float *cpu_output, int batch_size) {
+  Dims input_dims = e.context->getTensorShape(e.inputName.c_str());
+  input_dims.d[0] = batch_size;
+  if (!e.context->setInputShape(e.inputName.c_str(), input_dims)) {
+    log_msg(LOG_ERROR, "engine", "failed to set runtime input batch shape");
+    return nullptr;
+  }
+
+  std::size_t input_bytes =
+      batch_size * e.inputElementsPerFrame * sizeof(float);
+  cudaMemcpyAsync(e.inputBuffer, cpu_input, input_bytes, cudaMemcpyHostToDevice,
+                  e.stream);
+
   e.context->enqueueV3(e.stream);
-  cudaMemcpyAsync(cpu_output, e.outputBuffer, e.outputBytes,
+
+  Dims output_dims = e.context->getTensorShape(e.outputName.c_str());
+  std::size_t output_elements = 1;
+  for (int i = 0; i < output_dims.nbDims; i++)
+    output_elements *= output_dims.d[i];
+  std::size_t output_bytes = output_elements * sizeof(float);
+
+  cudaMemcpyAsync(cpu_output, e.outputBuffer, output_bytes,
                   cudaMemcpyDeviceToHost, e.stream);
   cudaStreamSynchronize(e.stream);
+
+  std::unique_ptr<float[]> output{new float[output_elements]};
+  std::copy(cpu_output, cpu_output + output_elements, output.get());
+
+  return output;
 }
 
 void destroy_engine(Engine &e) {

@@ -16,5 +16,5 @@ struct Preprocessor {
 };
 
 void initPreprocess(Preprocessor &p, int srcW, int srcH, int srcPixFmt);
-void preprocess(Preprocessor &p, AVFrame *src, float *dst);
+std::unique_ptr<float[]> preprocess(Preprocessor &p, AVFrame *src, float *dst);
 void destroyPreprocess(Preprocessor &p);

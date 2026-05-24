@@ -109,11 +109,8 @@ Run the pipeline from an existing engine file:
 ./build/argus \
   --engine output/yolov8n_dynamic_simplify.engine \
   --input rtsp://source \
-  --rtsp-transport tcp \
   --output rtsp://localhost:8554/argus
 ```
-
-Use `--rtsp-transport udp` for sources that reject TCP interleaved RTSP.
 
 ## Output
 
