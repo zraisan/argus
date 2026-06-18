@@ -1,5 +1,7 @@
 #pragma once
 
+#include "preprocess.hxx"
+
 extern "C" {
 #include <libavutil/frame.h>
 }
@@ -13,6 +15,7 @@ struct Detection {
 };
 
 std::vector<Detection> postprocess(const float *output, // [1, max_dets, 6]
-                                   int maxDets, int srcW, int srcH);
+                                   int maxDets, int srcW, int srcH,
+                                   const LetterboxTransform &letterbox);
 
 void draw_box(const std::vector<Detection> &dets, AVFrame *frame);

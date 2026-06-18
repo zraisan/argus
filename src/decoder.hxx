@@ -1,6 +1,7 @@
 #pragma once
 
 #include "postprocess.hxx"
+#include "preprocess.hxx"
 #include "streams.hxx"
 #include <memory>
 #include <utility>
@@ -26,6 +27,7 @@ struct StreamFrame {
   int stream_index = -1;
   int64_t frame_id = 0;
   AVRational frame_rate = {30, 1};
+  LetterboxTransform letterbox;
   std::unique_ptr<float[]> frame_rgb;
   std::unique_ptr<float[]> output;
   std::vector<Detection> detections;
@@ -62,6 +64,7 @@ private:
     stream_index = other.stream_index;
     frame_id = other.frame_id;
     frame_rate = other.frame_rate;
+    letterbox = other.letterbox;
     frame_rgb = std::move(other.frame_rgb);
     output = std::move(other.output);
     detections = std::move(other.detections);

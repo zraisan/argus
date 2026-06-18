@@ -14,30 +14,50 @@
 argus is a C++ live object detection pipeline for video streams. It decodes an
 input with FFmpeg/libav, preprocesses frames for YOLO, runs inference with
 TensorRT, draws bounding boxes on the decoded frame, encodes the result with
-NVIDIA NVENC, and writes the processed video to a stream output.
+NVIDIA NVENC or libx264, and writes the processed video to a stream output.
 
 The project is currently focused on learning and building the full video path
 step by step.
 
 ## Demo
 
+Single stream:
+
 <p align="center">
-  <img src="docs/assets/argus_vtest_demo.gif" alt="argus RTSP YOLO demo" width="100%">
+  <img src="docs/assets/argus_1_stream_yolo11s_demo.gif" alt="argus YOLO11s single stream demo" width="100%">
 </p>
 
-The demo uses OpenCV's `vtest.avi` sample as an RTSP source relayed through
-MediaMTX. The processed output shows YOLO detections drawn on the live stream
-and re-published through RTSP.
+Two streams:
+
+<p align="center">
+  <img src="docs/assets/argus_2_streams_yolo11s_demo.gif" alt="argus YOLO11s two stream demo" width="100%">
+</p>
+
+Thirty-two streams:
+
+<p align="center">
+  <img src="docs/assets/argus_32_streams_yolo11s_demo.gif" alt="argus YOLO11s 32 stream demo" width="100%">
+</p>
+
+The demos use public HLS traffic cameras processed with YOLO11s. Argus decodes
+the inputs, runs TensorRT inference, draws detections, and writes processed HLS
+outputs.
+
+The one-stream and two-stream demos were captured as separate runs with only
+those inputs active.
+
+All demos were captured on an NVIDIA GeForce RTX 3070 Laptop GPU with 8 GB of
+VRAM.
 
 ## Features
 
 - **Stream Input**: Opens video inputs through FFmpeg/libav, including RTSP, HLS, HTTP media, and local files
 - **NVIDIA Decode Path**: Prefers CUVID decoders such as `h264_cuvid` when the input codec supports them
 - **TensorRT Inference**: Builds and runs a TensorRT engine from a YOLO ONNX model
-- **Frame Preprocessing**: Converts decoded frames into the RGB tensor layout expected by the model
+- **Frame Preprocessing**: Letterboxes decoded frames into the RGB tensor layout expected by the model
 - **Postprocessing**: Converts model output into detection boxes in source-frame coordinates
 - **Bounding Box Overlay**: Draws detections directly onto the local decoded video frame
-- **NVIDIA Encoding**: Encodes processed frames through `h264_nvenc`
+- **H.264 Encoding**: Prefers `h264_nvenc` and falls back to `libx264`
 - **Stream Output**: Writes encoded packets to RTSP, HLS, MP4, MPEG-TS, or Matroska outputs through FFmpeg/libav
 
 ## Pipeline
@@ -46,20 +66,78 @@ and re-published through RTSP.
 
 ```mermaid
 flowchart TD
-    input[Input URLs] --> decode[Decode threads]
-    decode --> decoded_q[Decoded frame queue]
-    decoded_q --> preprocess[Preprocess threads]
-    preprocess --> tensor_q[Preprocessed tensor queue]
-    tensor_q --> infer[TensorRT batch inference]
+    inputs[Input URLs] --> work_q[Decode work queue]
+
+    subgraph decode_pool[Decode Thread Pool]
+      dec1[Decoder worker]
+      dec2[Decoder worker]
+      decn[Decoder worker]
+    end
+
+    work_q --> dec1
+    work_q --> dec2
+    work_q --> decn
+    dec1 --> decoded_q[Decoded frame queue]
+    dec2 --> decoded_q
+    decn --> decoded_q
+
+    subgraph preprocess_pool[Preprocess Thread Pool]
+      pre1[Preprocess worker]
+      pre2[Preprocess worker]
+      pren[Preprocess worker]
+    end
+
+    decoded_q --> pre1
+    decoded_q --> pre2
+    decoded_q --> pren
+    pre1 --> tensor_q[Preprocessed tensor queue]
+    pre2 --> tensor_q
+    pren --> tensor_q
+
+    tensor_q --> batcher[Batch collector]
+    batcher --> infer[Shared TensorRT inference thread]
     infer --> result_q[Inference result queue]
-    result_q --> postprocess[Postprocess threads]
-    postprocess --> post_q[Postprocessed frame queue]
-    post_q --> draw[Draw threads]
-    draw --> encode_q[Encode queue]
-    encode_q --> encode[Encode threads]
-    encode --> state[Per-stream encoder and muxer state]
+
+    subgraph post_pool[Postprocess Thread Pool]
+      post1[Postprocess worker]
+      post2[Postprocess worker]
+      postn[Postprocess worker]
+    end
+
+    result_q --> post1
+    result_q --> post2
+    result_q --> postn
+    post1 --> post_q[Postprocessed frame queue]
+    post2 --> post_q
+    postn --> post_q
+
+    subgraph draw_pool[Draw Thread Pool]
+      draw1[Draw worker]
+      draw2[Draw worker]
+      drawn[Draw worker]
+    end
+
+    post_q --> draw1
+    post_q --> draw2
+    post_q --> drawn
+    draw1 --> encode_q[Encode queue]
+    draw2 --> encode_q
+    drawn --> encode_q
+
+    subgraph encode_pool[Encode Thread Pool]
+      enc1[Encode worker]
+      enc2[Encode worker]
+      encn[Encode worker]
+    end
+
+    encode_q --> enc1
+    encode_q --> enc2
+    encode_q --> encn
+    enc1 --> state[Per-stream encoder and muxer state]
+    enc2 --> state
+    encn --> state
     state --> order[Frame ordering by frame_id]
-    order --> output[Stream outputs]
+    order --> outputs[Stream outputs]
 ```
 
 </div>
@@ -68,6 +146,146 @@ Decode opens one FFmpeg decoder per input stream. Later stages use shared
 queues and stage thread pools. TensorRT receives batches up to the configured
 engine batch size, and encode keeps per-stream output state so each stream is
 written in frame order.
+
+### Thread Allocation
+
+Argus currently chooses stage thread counts automatically from
+`std::thread::hardware_concurrency()`.
+
+```text
+reserved_threads =
+  4 when hardware_threads >= 16
+  2 when hardware_threads >= 8
+  1 otherwise
+
+inference_threads = 1
+max_threads = hardware_threads - reserved_threads - inference_threads
+```
+
+The remaining worker threads are split across pipeline stages:
+
+```text
+decode      40%
+preprocess  10%
+postprocess 10%
+draw         10%
+encode      30%
+```
+
+Each stage keeps at least one thread because the configured defaults start at
+`1`. On a 24-thread machine, the current split is:
+
+```text
+hardware_threads = 24
+reserved_threads = 4
+inference_threads = 1
+max_threads = 19
+
+decode      7 threads
+preprocess  1 thread
+postprocess 1 thread
+draw        1 thread
+encode      5 threads
+inference   1 thread
+```
+
+The percentage math uses integer division, so unused remainder threads are not
+assigned yet.
+
+### Stage Details
+
+Decode scheduling:
+
+```mermaid
+flowchart LR
+    urls[Input URLs] --> states[DecodeState per stream]
+    urls --> work_q[Decode work queue: stream index]
+    work_q --> worker[Decoder worker]
+    states --> worker
+    worker --> opened{Stream opened?}
+    opened -- no --> open_stream[openStream and read frame rate]
+    opened -- yes --> next_frame[nextFrame]
+    open_stream --> next_frame
+    next_frame -- decoded frame --> clone[av_frame_clone]
+    clone --> stream_frame[StreamFrame: frame, stream index, frame id, fps]
+    stream_frame --> decoded_q[Decoded frame queue]
+    stream_frame --> requeue[Requeue stream index]
+    requeue --> work_q
+    next_frame -- EOF or error --> close_stream[closeStream]
+    close_stream --> active_count[Decrease active stream count]
+    active_count --> maybe_close[Close work queue when all streams end]
+```
+
+Preprocess:
+
+```mermaid
+flowchart LR
+    decoded_q[Decoded frame queue] --> pre_worker[Preprocess worker]
+    pre_worker --> format_check{Frame size or format changed?}
+    format_check -- yes --> init[Create sws context]
+    format_check -- no --> letterbox
+    init --> letterbox[Compute letterbox scale and padding]
+    letterbox --> rgb[sws_scale into RGB buffer]
+    rgb --> chw[Normalize RGB to CHW float tensor]
+    chw --> attach[Attach letterbox metadata to StreamFrame]
+    attach --> tensor_q[Preprocessed tensor queue]
+```
+
+Inference:
+
+```mermaid
+flowchart LR
+    tensor_q[Preprocessed tensor queue] --> batcher[Batch collector]
+    batcher --> fill[Copy frame tensors into batched CPU input]
+    fill --> infer[run_inference with current batch size]
+    infer --> trt[TensorRT execution context]
+    trt --> output[Batch output tensor]
+    output --> split[Split output back per StreamFrame]
+    split --> result_q[Inference result queue]
+```
+
+Postprocess:
+
+```mermaid
+flowchart LR
+    result_q[Inference result queue] --> post_worker[Postprocess worker]
+    post_worker --> parse[Read YOLO NMS output: max 300 rows]
+    parse --> undo[Undo letterbox scale and padding]
+    undo --> clamp[Clamp boxes to source frame]
+    clamp --> dets[Detection vector]
+    dets --> post_q[Postprocessed frame queue]
+```
+
+Draw:
+
+```mermaid
+flowchart LR
+    post_q[Postprocessed frame queue] --> draw_worker[Draw worker]
+    draw_worker --> writable[av_frame_make_writable]
+    writable --> pixfmt{Pixel format}
+    pixfmt -- nv12 --> draw_nv12[Draw YUV boxes into NV12 planes]
+    pixfmt -- yuv420p --> draw_yuv420p[Draw YUV boxes into YUV420P planes]
+    draw_nv12 --> encode_q[Encode queue]
+    draw_yuv420p --> encode_q
+```
+
+Encode and output:
+
+```mermaid
+flowchart LR
+    encode_q[Encode queue] --> enc_worker[Encode worker]
+    enc_worker --> state[Per-stream OutputState]
+    state --> pending[Store frame by frame id]
+    pending --> order{Next frame id ready?}
+    order -- no --> wait[Keep pending]
+    order -- yes --> opened{Output opened?}
+    opened -- no --> open_encoder[Open h264_nvenc or fall back to libx264]
+    open_encoder --> open_server[Open output muxer]
+    opened -- yes --> serve
+    open_server --> serve[Encode frame and write packet]
+    serve --> advance[Advance next frame id]
+    advance --> order
+```
 
 ## Requirements
 
@@ -109,15 +327,16 @@ After exporting the YOLO ONNX model, build a TensorRT engine file:
 
 ```bash
 ./build/argus --build \
-  --model input/models/yolov8n_dynamic_simplify.onnx \
-  --engine output/yolov8n_dynamic_simplify.engine
+  --model input/models/yolo11s_dynamic_simplify_nms.onnx \
+  --engine output/yolo11s_dynamic_simplify_nms.engine \
+  --batch 16
 ```
 
 Run the pipeline from an existing engine file:
 
 ```bash
 ./build/argus \
-  --engine output/yolov8n_dynamic_simplify.engine \
+  --engine output/yolo11s_dynamic_simplify_nms.engine \
   --input rtsp://source \
   --output rtsp://localhost:8554/argus
 ```
@@ -155,7 +374,7 @@ For HLS output, argus writes a playlist and segment files:
 
 ```bash
 ./build/argus \
-  --engine output/yolov8n_dynamic_simplify.engine \
+  --engine output/yolo11s_dynamic_simplify_nms.engine \
   --input rtsp://source \
   --output output/argus.m3u8
 ```
@@ -195,10 +414,14 @@ output tensor shaped like:
 [batch, 300, 6]
 ```
 
-For Ultralytics YOLOv8, export with:
+Preprocessing keeps the source aspect ratio with letterbox padding. Postprocess
+uses the recorded scale and padding to map model boxes back to source-frame
+coordinates.
+
+For Ultralytics YOLO11s, export with:
 
 ```bash
-yolo export model=yolov8n.pt format=onnx imgsz=640 opset=17 dynamic=True nms=True simplify=True
+yolo export model=yolo11s.pt format=onnx imgsz=640 opset=17 dynamic=True nms=True simplify=True max_det=300 batch=16
 ```
 
 The `simplify=True` export has been tested with TensorRT. The non-simplified

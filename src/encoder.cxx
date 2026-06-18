@@ -12,6 +12,8 @@ extern "C" {
 
 namespace {
 
+enum class EncoderBackend { Nvenc, X264 };
+
 bool supports_pixel_format(const AVCodec *codec, AVPixelFormat pix_fmt) {
   const void *configs = nullptr;
   int num_configs = 0;
@@ -56,35 +58,58 @@ AVRational stream_fps(AVStream *stream) {
   return AVRational{30, 1};
 }
 
-} // namespace
-
-bool open_encoder(Encoder &e, AVStream *in_stream,
-                  AVCodecContext *decoder_codec_ctx) {
-  if (!decoder_codec_ctx) {
-    log_msg(LOG_ERROR, "encoder", "decoder codec context is null");
-    return false;
+const char *backend_codec_name(EncoderBackend backend) {
+  switch (backend) {
+  case EncoderBackend::Nvenc:
+    return "h264_nvenc";
+  case EncoderBackend::X264:
+    return "libx264";
   }
-
-  return open_encoder(e, decoder_codec_ctx->width, decoder_codec_ctx->height,
-                      (AVPixelFormat)decoder_codec_ctx->pix_fmt,
-                      stream_fps(in_stream));
+  return nullptr;
 }
 
-bool open_encoder(Encoder &e, int width, int height, AVPixelFormat pix_fmt,
-                  AVRational fps) {
-  log_msg(LOG_INFO, "encoder", "finding NVIDIA H.264 encoder h264_nvenc");
-  const AVCodec *codec = avcodec_find_encoder_by_name("h264_nvenc");
+const char *backend_label(EncoderBackend backend) {
+  switch (backend) {
+  case EncoderBackend::Nvenc:
+    return "NVENC";
+  case EncoderBackend::X264:
+    return "x264";
+  }
+  return "unknown";
+}
+
+void set_backend_options(AVDictionary **opts, EncoderBackend backend) {
+  if (backend == EncoderBackend::Nvenc) {
+    av_dict_set(opts, "preset", "p1", 0);
+    av_dict_set(opts, "tune", "ull", 0);
+    av_dict_set(opts, "rc", "cbr", 0);
+    log_msg(LOG_INFO, "encoder", "NVENC options preset=p1 tune=ull rc=cbr");
+    return;
+  }
+
+  av_dict_set(opts, "preset", "ultrafast", 0);
+  av_dict_set(opts, "tune", "zerolatency", 0);
+  log_msg(LOG_INFO, "encoder",
+          "x264 options preset=ultrafast tune=zerolatency");
+}
+
+bool open_encoder_backend(Encoder &e, int width, int height,
+                          AVPixelFormat pix_fmt, AVRational fps,
+                          EncoderBackend backend) {
+  const char *codec_name = backend_codec_name(backend);
+  log_msg(LOG_INFO, "encoder",
+          std::string("finding H.264 encoder ") + codec_name);
+  const AVCodec *codec = avcodec_find_encoder_by_name(codec_name);
   if (!codec) {
-    log_msg(LOG_ERROR, "encoder",
-            "could not find NVIDIA H.264 encoder h264_nvenc");
+    log_msg(LOG_WARNING, "encoder",
+            std::string("could not find H.264 encoder ") + codec_name);
     return false;
   }
 
   if (!supports_pixel_format(codec, pix_fmt)) {
-    log_msg(LOG_ERROR, "encoder",
-            "encoder does not support input pixel format " +
-                av_pixel_format_name(pix_fmt) +
-                ". Convert frames before encoding.");
+    log_msg(LOG_WARNING, "encoder",
+            std::string(codec_name) + " does not support input pixel format " +
+                av_pixel_format_name(pix_fmt));
     return false;
   }
 
@@ -113,30 +138,33 @@ bool open_encoder(Encoder &e, int width, int height, AVPixelFormat pix_fmt,
   e.codec_ctx->bit_rate = 4000000;
   e.codec_ctx->gop_size = fps_rounded;
   e.codec_ctx->max_b_frames = 0;
+  if (backend == EncoderBackend::X264)
+    e.codec_ctx->thread_count = 1;
 
   log_msg(LOG_INFO, "encoder",
-          "config width=" + std::to_string(e.codec_ctx->width) +
+          "config backend=" + std::string(backend_label(backend)) +
+              " width=" + std::to_string(e.codec_ctx->width) +
               " height=" + std::to_string(e.codec_ctx->height) +
               " pix_fmt=" + av_pixel_format_name(e.codec_ctx->pix_fmt) +
               " fps=" + av_rational_string(fps) +
               " time_base=" + av_rational_string(e.codec_ctx->time_base) +
               " bitrate=" + std::to_string(e.codec_ctx->bit_rate) +
               " gop=" + std::to_string(e.codec_ctx->gop_size) +
-              " max_b_frames=" + std::to_string(e.codec_ctx->max_b_frames));
+              " max_b_frames=" + std::to_string(e.codec_ctx->max_b_frames) +
+              " threads=" + std::to_string(e.codec_ctx->thread_count));
 
   AVDictionary *opts = nullptr;
-  av_dict_set(&opts, "preset", "p1", 0);
-  av_dict_set(&opts, "tune", "ull", 0);
-  av_dict_set(&opts, "rc", "cbr", 0);
-  log_msg(LOG_INFO, "encoder", "NVENC options preset=p1 tune=ull rc=cbr");
+  set_backend_options(&opts, backend);
 
-  int ret = 0;
-  log_msg(LOG_INFO, "encoder", "avcodec_open2 started");
-  ret = avcodec_open2(e.codec_ctx, codec, &opts);
-  log_msg(LOG_INFO, "encoder", "avcodec_open2 finished");
+  log_msg(LOG_INFO, "encoder",
+          std::string("avcodec_open2 started for ") + codec_name);
+  int ret = avcodec_open2(e.codec_ctx, codec, &opts);
+  log_msg(LOG_INFO, "encoder",
+          std::string("avcodec_open2 finished for ") + codec_name);
   av_dict_free(&opts);
   if (ret < 0) {
-    log_av_error(LOG_ERROR, "encoder", "opening encoder failed", ret);
+    std::string where = std::string("opening ") + codec_name + " failed";
+    log_av_error(LOG_WARNING, "encoder", where.c_str(), ret);
     close_encoder(e);
     return false;
   }
@@ -150,6 +178,36 @@ bool open_encoder(Encoder &e, int width, int height, AVPixelFormat pix_fmt,
 
   log_msg(LOG_INFO, "encoder", std::string("encoder opened: ") + codec->name);
   return true;
+}
+
+} // namespace
+
+bool open_encoder(Encoder &e, AVStream *in_stream,
+                  AVCodecContext *decoder_codec_ctx) {
+  if (!decoder_codec_ctx) {
+    log_msg(LOG_ERROR, "encoder", "decoder codec context is null");
+    return false;
+  }
+
+  return open_encoder(e, decoder_codec_ctx->width, decoder_codec_ctx->height,
+                      (AVPixelFormat)decoder_codec_ctx->pix_fmt,
+                      stream_fps(in_stream));
+}
+
+bool open_encoder(Encoder &e, int width, int height, AVPixelFormat pix_fmt,
+                  AVRational fps) {
+  if (open_encoder_backend(e, width, height, pix_fmt, fps,
+                           EncoderBackend::Nvenc))
+    return true;
+
+  log_msg(LOG_WARNING, "encoder",
+          "falling back to libx264 software encoder");
+  if (open_encoder_backend(e, width, height, pix_fmt, fps,
+                           EncoderBackend::X264))
+    return true;
+
+  log_msg(LOG_ERROR, "encoder", "all H.264 encoder backends failed");
+  return false;
 }
 
 bool serve_stream(Encoder &e, Server &s, AVFrame *frame) {

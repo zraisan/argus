@@ -32,17 +32,22 @@ constexpr YuvColor Teal = {120, 149, 84};
 } // namespace
 
 std::vector<Detection> postprocess(const float *output, // [1, max_dets, 6]
-                                   int maxDets, int srcW, int srcH) {
+                                   int maxDets, int srcW, int srcH,
+                                   const LetterboxTransform &letterbox) {
   std::vector<Detection> dets;
   for (int i = 0; i < maxDets; i++) {
-    float x1 = output[i * 6] * srcW / 640.0f;
-    float y1 = output[i * 6 + 1] * srcH / 640.0f;
-    float x2 = output[i * 6 + 2] * srcW / 640.0f;
-    float y2 = output[i * 6 + 3] * srcH / 640.0f;
+    float x1 = (output[i * 6] - letterbox.pad_x) / letterbox.scale;
+    float y1 = (output[i * 6 + 1] - letterbox.pad_y) / letterbox.scale;
+    float x2 = (output[i * 6 + 2] - letterbox.pad_x) / letterbox.scale;
+    float y2 = (output[i * 6 + 3] - letterbox.pad_y) / letterbox.scale;
     float conf = output[i * 6 + 4];
     int classId = output[i * 6 + 5];
     if (conf <= 0.0f)
       break; // Ouput sometimes add padded 0s to the maxDets
+    x1 = std::clamp(x1, 0.0f, (float)(srcW - 1));
+    y1 = std::clamp(y1, 0.0f, (float)(srcH - 1));
+    x2 = std::clamp(x2, 0.0f, (float)(srcW - 1));
+    y2 = std::clamp(y2, 0.0f, (float)(srcH - 1));
     dets.push_back({x1, y1, x2, y2, conf, classId});
   }
   return dets;

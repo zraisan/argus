@@ -8,7 +8,6 @@
 #include "streams.hxx"
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cxxopts.hpp>
 #include <functional>
 #include <iostream>
@@ -23,8 +22,8 @@
 struct AppConfig {
   bool build = false;
   bool help = false;
-  std::string model_path = "input/models/yolov8n.onnx";
-  std::string engine_path = "output/yolov8n.engine";
+  std::string model_path = "input/models/yolo11s_dynamic_simplify_nms.onnx";
+  std::string engine_path = "output/yolo11s_dynamic_simplify_nms.engine";
   std::vector<std::string> input_urls;
   std::string output_url = "rtsp://localhost:8554/argus";
   int decoder_threads_count = 1;
@@ -39,9 +38,18 @@ struct OutputState {
   Encoder encoder;
   Server server;
   bool output_opened = false;
+  bool output_failed = false;
   int64_t next_frame_id = 0;
   std::map<int64_t, StreamFrame> pending_frames;
   std::mutex mutex;
+};
+
+struct DecodeState {
+  Decoder decoder;
+  int stream_index = -1;
+  int64_t frame_count = 0;
+  AVRational frame_rate = {30, 1};
+  bool opened = false;
 };
 
 bool parse_args(int argc, char **argv, AppConfig &config) {
@@ -113,54 +121,81 @@ AVRational decoder_frame_rate(Decoder &decoder) {
   return AVRational{30, 1};
 }
 
-void run_decode(const AppConfig &config, std::atomic<int> &next_stream_index,
-                ThreadQueue<StreamFrame> &decoder_queue,
-                std::atomic<bool> &pipeline_ok) {
-  int stream_count = (int)config.input_urls.size();
+bool decode_one_frame(const AppConfig &config, DecodeState &state,
+                      ThreadQueue<StreamFrame> &decoder_queue,
+                      std::atomic<bool> &pipeline_ok) {
+  int stream_index = state.stream_index;
 
-  while (true) {
-    int stream_index = next_stream_index++;
-    if (stream_index >= stream_count)
-      break;
-
+  if (!state.opened) {
     const std::string &input_url = config.input_urls[stream_index];
     log_msg(LOG_INFO, "decoder",
             "stream " + std::to_string(stream_index) + " input: " + input_url);
 
-    Decoder decoder;
-    if (!openStream(decoder, input_url.c_str())) {
+    if (!openStream(state.decoder, input_url.c_str())) {
+      pipeline_ok = false;
+      closeStream(state.decoder);
+      return false;
+    }
+
+    state.frame_rate = decoder_frame_rate(state.decoder);
+    state.opened = true;
+  }
+
+  if (!nextFrame(state.decoder)) {
+    closeStream(state.decoder);
+    state.opened = false;
+    log_msg(LOG_INFO, "decoder",
+            "stream " + std::to_string(stream_index) +
+                " decoded frames=" + std::to_string(state.frame_count));
+    return false;
+  }
+
+  int64_t frame_id = state.frame_count++;
+  if (state.frame_count == 1)
+    log_msg(LOG_INFO, "decoder",
+            "stream " + std::to_string(stream_index) + " first frame decoded");
+
+  AVFrame *frame = av_frame_clone(state.decoder.frame);
+  if (!frame) {
+    log_msg(LOG_ERROR, "decoder", "could not clone decoded frame");
+    pipeline_ok = false;
+    closeStream(state.decoder);
+    state.opened = false;
+    return false;
+  }
+
+  if (!decoder_queue.push(
+          StreamFrame{frame, stream_index, frame_id, state.frame_rate})) {
+    av_frame_free(&frame);
+    return false;
+  }
+
+  return true;
+}
+
+void run_decode(const AppConfig &config, ThreadQueue<int> &decode_work_queue,
+                std::vector<std::unique_ptr<DecodeState>> &decode_states,
+                ThreadQueue<StreamFrame> &decoder_queue,
+                std::atomic<int> &active_decode_streams,
+                std::atomic<bool> &pipeline_ok) {
+  int stream_index = -1;
+  while (decode_work_queue.pop(stream_index)) {
+    if (stream_index < 0 || stream_index >= (int)decode_states.size()) {
+      log_msg(LOG_ERROR, "decoder", "invalid decode stream index");
       pipeline_ok = false;
       continue;
     }
 
-    AVRational frame_rate = decoder_frame_rate(decoder);
-    int64_t frame_count = 0;
-
-    while (nextFrame(decoder)) {
-      int64_t frame_id = frame_count++;
-      if (frame_count == 1)
-        log_msg(LOG_INFO, "decoder",
-                "stream " + std::to_string(stream_index) +
-                    " first frame decoded");
-
-      AVFrame *frame = av_frame_clone(decoder.frame);
-      if (!frame) {
-        log_msg(LOG_ERROR, "decoder", "could not clone decoded frame");
-        pipeline_ok = false;
-        break;
-      }
-
-      if (!decoder_queue.push(
-              StreamFrame{frame, stream_index, frame_id, frame_rate})) {
-        av_frame_free(&frame);
-        break;
-      }
+    DecodeState &state = *decode_states[stream_index];
+    bool keep_active =
+        decode_one_frame(config, state, decoder_queue, pipeline_ok);
+    if (keep_active) {
+      decode_work_queue.push(stream_index);
+      continue;
     }
 
-    closeStream(decoder);
-    log_msg(LOG_INFO, "decoder",
-            "stream " + std::to_string(stream_index) +
-                " decoded frames=" + std::to_string(frame_count));
+    if (--active_decode_streams == 0)
+      decode_work_queue.close();
   }
 }
 
@@ -187,6 +222,7 @@ void run_preprocess(ThreadQueue<StreamFrame> &decoder_queue,
     }
 
     item.frame_rgb = preprocess(pre, item.frame, cpu_input.get());
+    item.letterbox = pre.letterbox;
     preprocessor_queue.push(std::move(item));
   }
 
@@ -264,8 +300,9 @@ void run_postprocess(ThreadQueue<StreamFrame> &inference_queue,
                      int max_dets) {
   StreamFrame item;
   while (inference_queue.pop(item)) {
-    item.detections = postprocess(item.output.get(), max_dets,
-                                  item.frame->width, item.frame->height);
+    item.detections =
+        postprocess(item.output.get(), max_dets, item.frame->width,
+                    item.frame->height, item.letterbox);
     postprocessor_queue.push(std::move(item));
   }
 }
@@ -281,11 +318,15 @@ void run_draw(ThreadQueue<StreamFrame> &postprocessor_queue,
 
 bool encode_output_frame(OutputState &state, const AppConfig &config,
                          StreamFrame &item, std::atomic<bool> &pipeline_ok) {
+  if (state.output_failed)
+    return false;
+
   if (!state.output_opened) {
     std::string output_url =
         indexed_output_url(config.output_url, item.stream_index);
     if (!open_encoder(state.encoder, item.frame->width, item.frame->height,
                       (AVPixelFormat)item.frame->format, item.frame_rate)) {
+      state.output_failed = true;
       pipeline_ok = false;
       return false;
     }
@@ -293,6 +334,7 @@ bool encode_output_frame(OutputState &state, const AppConfig &config,
     if (!open_server(state.server, output_url.c_str(),
                      state.encoder.codec_ctx)) {
       close_encoder(state.encoder);
+      state.output_failed = true;
       pipeline_ok = false;
       return false;
     }
@@ -302,6 +344,7 @@ bool encode_output_frame(OutputState &state, const AppConfig &config,
 
   if (!serve_stream(state.encoder, state.server, item.frame)) {
     log_msg(LOG_ERROR, "main", "frame encode or publish failed");
+    state.output_failed = true;
     pipeline_ok = false;
     return false;
   }
@@ -379,14 +422,16 @@ void run_encode(const AppConfig &config,
 bool run_stream(Engine &engine, const AppConfig &config, int batch_size) {
   int stream_count = (int)config.input_urls.size();
   int max_dets = (int)(engine.outputElementsPerFrame / 6);
-  std::atomic<int> next_decode_stream{0};
+  std::atomic<int> active_decode_streams{stream_count};
   std::atomic<bool> pipeline_ok{true};
 
-  ThreadQueue<StreamFrame> decoder_queue;
-  ThreadQueue<StreamFrame> preprocessor_queue;
-  ThreadQueue<StreamFrame> inference_queue;
-  ThreadQueue<StreamFrame> postprocessor_queue;
-  ThreadQueue<StreamFrame> encoder_queue;
+  ThreadQueue<int> decode_work_queue(std::max(1, stream_count));
+  ThreadQueue<StreamFrame> decoder_queue(std::max(4, stream_count * 2));
+  ThreadQueue<StreamFrame> preprocessor_queue(std::max(4, stream_count * 2));
+  ThreadQueue<StreamFrame> inference_queue(std::max(4, stream_count * 2));
+  ThreadQueue<StreamFrame> postprocessor_queue(std::max(4, stream_count * 2));
+  ThreadQueue<StreamFrame> encoder_queue(std::max(4, stream_count * 2));
+  std::vector<std::unique_ptr<DecodeState>> decode_states;
   std::vector<std::unique_ptr<OutputState>> output_states;
 
   std::vector<std::thread> decoder_threads;
@@ -400,15 +445,24 @@ bool run_stream(Engine &engine, const AppConfig &config, int batch_size) {
   postprocess_threads.reserve(config.postprocessor_threads_count);
   draw_threads.reserve(config.drawer_threads_count);
   encode_threads.reserve(config.encoder_threads_count);
+  decode_states.reserve(stream_count);
   output_states.reserve(stream_count);
 
   log_msg(LOG_INFO, "main",
           "max detections from model output: " + std::to_string(max_dets));
 
+  for (int stream_index = 0; stream_index < stream_count; stream_index++) {
+    auto state = std::make_unique<DecodeState>();
+    state->stream_index = stream_index;
+    decode_states.push_back(std::move(state));
+    decode_work_queue.push(stream_index);
+  }
+
   for (int i = 0; i < config.decoder_threads_count; i++) {
     decoder_threads.emplace_back(
-        run_decode, std::ref(config), std::ref(next_decode_stream),
-        std::ref(decoder_queue), std::ref(pipeline_ok));
+        run_decode, std::ref(config), std::ref(decode_work_queue),
+        std::ref(decode_states), std::ref(decoder_queue),
+        std::ref(active_decode_streams), std::ref(pipeline_ok));
   }
 
   for (int i = 0; i < config.preprocessor_threads_count; i++) {
@@ -512,7 +566,7 @@ int main(int argc, char **argv) {
   int stream_count = input_count;
 
   config.decoder_threads_count =
-      std::max(config.decoder_threads_count, max_threads * 3 / 10);
+      std::max(config.decoder_threads_count, max_threads * 4 / 10);
   config.preprocessor_threads_count =
       std::max(config.preprocessor_threads_count, max_threads * 1 / 10);
   config.postprocessor_threads_count =
