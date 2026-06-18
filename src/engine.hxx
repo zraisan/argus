@@ -20,10 +20,12 @@ struct Engine {
   std::string outputName;
   std::size_t inputElementsPerFrame = 0;
   std::size_t outputElementsPerFrame = 0;
+  int maxBatchSize = 0;
   cudaStream_t stream = nullptr;
 };
 
-bool build_engine_file(const char *onnx_path, const char *engine_path);
+bool build_engine_file(const char *onnx_path, const char *engine_path,
+                       int batch_size);
 Engine load_engine(const char *engine_path, int batch_size);
 std::unique_ptr<float[]> run_inference(Engine &e, const float *cpu_input,
                                        float *cpu_output, int batch_size);

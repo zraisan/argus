@@ -9,6 +9,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/frame.h>
+#include <libavutil/rational.h>
 }
 
 struct Decoder {
@@ -24,13 +25,16 @@ struct StreamFrame {
   AVFrame *frame = nullptr;
   int stream_index = -1;
   int64_t frame_id = 0;
+  AVRational frame_rate = {30, 1};
   std::unique_ptr<float[]> frame_rgb;
   std::unique_ptr<float[]> output;
   std::vector<Detection> detections;
 
   StreamFrame() = default;
-  StreamFrame(AVFrame *frame, int stream_index, int64_t frame_id)
-      : frame(frame), stream_index(stream_index), frame_id(frame_id) {}
+  StreamFrame(AVFrame *frame, int stream_index, int64_t frame_id,
+              AVRational frame_rate = {30, 1})
+      : frame(frame), stream_index(stream_index), frame_id(frame_id),
+        frame_rate(frame_rate) {}
 
   ~StreamFrame() {
     if (frame)
@@ -57,6 +61,7 @@ private:
     other.frame = nullptr;
     stream_index = other.stream_index;
     frame_id = other.frame_id;
+    frame_rate = other.frame_rate;
     frame_rgb = std::move(other.frame_rgb);
     output = std::move(other.output);
     detections = std::move(other.detections);

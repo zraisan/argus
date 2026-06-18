@@ -1,7 +1,7 @@
 #include "encoder.hxx"
-#include "streams.hxx"
 #include "logger.hxx"
 #include "server.hxx"
+#include "streams.hxx"
 
 #include <string>
 
@@ -65,6 +65,13 @@ bool open_encoder(Encoder &e, AVStream *in_stream,
     return false;
   }
 
+  return open_encoder(e, decoder_codec_ctx->width, decoder_codec_ctx->height,
+                      (AVPixelFormat)decoder_codec_ctx->pix_fmt,
+                      stream_fps(in_stream));
+}
+
+bool open_encoder(Encoder &e, int width, int height, AVPixelFormat pix_fmt,
+                  AVRational fps) {
   log_msg(LOG_INFO, "encoder", "finding NVIDIA H.264 encoder h264_nvenc");
   const AVCodec *codec = avcodec_find_encoder_by_name("h264_nvenc");
   if (!codec) {
@@ -73,29 +80,33 @@ bool open_encoder(Encoder &e, AVStream *in_stream,
     return false;
   }
 
-  AVPixelFormat pix_fmt = (AVPixelFormat)decoder_codec_ctx->pix_fmt;
   if (!supports_pixel_format(codec, pix_fmt)) {
     log_msg(LOG_ERROR, "encoder",
             "encoder does not support input pixel format " +
-                av_pixel_format_name(pix_fmt) + ". Convert frames before encoding.");
+                av_pixel_format_name(pix_fmt) +
+                ". Convert frames before encoding.");
     return false;
   }
 
-  log_msg(LOG_INFO, "encoder", std::string("allocating encoder context for ") +
-                               codec->name);
+  log_msg(LOG_INFO, "encoder",
+          std::string("allocating encoder context for ") + codec->name);
   e.codec_ctx = avcodec_alloc_context3(codec);
   if (!e.codec_ctx) {
     log_msg(LOG_ERROR, "encoder", "could not allocate encoder context");
     return false;
   }
 
-  AVRational fps = stream_fps(in_stream);
+  if (!sane_fps(fps)) {
+    log_msg(LOG_WARNING, "encoder", "using fallback fps 30/1");
+    fps = AVRational{30, 1};
+  }
+
   int fps_rounded = (int)(av_q2d(fps) + 0.5);
   if (fps_rounded <= 0)
     fps_rounded = 30;
 
-  e.codec_ctx->width = decoder_codec_ctx->width;
-  e.codec_ctx->height = decoder_codec_ctx->height;
+  e.codec_ctx->width = width;
+  e.codec_ctx->height = height;
   e.codec_ctx->pix_fmt = pix_fmt;
   e.codec_ctx->time_base = av_inv_q(fps);
   e.codec_ctx->framerate = fps;
@@ -158,7 +169,8 @@ bool serve_stream(Encoder &e, Server &s, AVFrame *frame) {
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
       return true;
     if (ret < 0) {
-      log_av_error(LOG_ERROR, "encoder", "receiving packet from encoder failed", ret);
+      log_av_error(LOG_ERROR, "encoder", "receiving packet from encoder failed",
+                   ret);
       return false;
     }
 

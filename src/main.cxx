@@ -12,7 +12,9 @@
 #include <cxxopts.hpp>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -25,7 +27,21 @@ struct AppConfig {
   std::string engine_path = "output/yolov8n.engine";
   std::vector<std::string> input_urls;
   std::string output_url = "rtsp://localhost:8554/argus";
-  int num_workers = 1;
+  int decoder_threads_count = 1;
+  int preprocessor_threads_count = 1;
+  int postprocessor_threads_count = 1;
+  int drawer_threads_count = 1;
+  int encoder_threads_count = 1;
+  int max_batch_size = 16;
+};
+
+struct OutputState {
+  Encoder encoder;
+  Server server;
+  bool output_opened = false;
+  int64_t next_frame_id = 0;
+  std::map<int64_t, StreamFrame> pending_frames;
+  std::mutex mutex;
 };
 
 bool parse_args(int argc, char **argv, AppConfig &config) {
@@ -34,6 +50,9 @@ bool parse_args(int argc, char **argv, AppConfig &config) {
       "model", "ONNX model path",
       cxxopts::value<std::string>(config.model_path)
           ->default_value(config.model_path))(
+      "batch", "Maximum batch size supported by the engine",
+      cxxopts::value<int>(config.max_batch_size)
+          ->default_value(std::to_string(config.max_batch_size)))(
       "engine", "TensorRT engine path",
       cxxopts::value<std::string>(config.engine_path)
           ->default_value(config.engine_path))(
@@ -41,11 +60,7 @@ bool parse_args(int argc, char **argv, AppConfig &config) {
       cxxopts::value<std::vector<std::string>>(config.input_urls))(
       "output", "Output stream URL",
       cxxopts::value<std::string>(config.output_url)
-          ->default_value(config.output_url))(
-      "workers", "The number of workers to process the streams",
-      cxxopts::value<int>(config.num_workers)
-          ->default_value(std::to_string(config.num_workers)))("h,help",
-                                                               "Show help");
+          ->default_value(config.output_url))("h,help", "Show help");
 
   try {
     auto result = options.parse(argc, argv);
@@ -79,108 +94,180 @@ std::string indexed_output_url(const std::string &url, int stream_index) {
   return url + index;
 }
 
-void run_decode(Decoder &decoder, ThreadQueue<StreamFrame> &decoder_queue,
-                int stream_index, std::atomic<int64_t> &frame_count,
-                std::atomic<bool> &stream_ok) {
-  while (nextFrame(decoder)) {
-    int64_t frame_id = frame_count++;
-    if (frame_count == 1)
-      log_msg(LOG_INFO, "main", "first frame decoded");
+bool sane_frame_rate(AVRational frame_rate) {
+  if (frame_rate.num <= 0 || frame_rate.den <= 0)
+    return false;
 
-    AVFrame *frame = av_frame_clone(decoder.frame);
-    if (!frame) {
-      log_msg(LOG_ERROR, "main", "could not clone decoded frame");
-      stream_ok = false;
-      break;
-    }
-
-    decoder_queue.push(StreamFrame{frame, stream_index, frame_id});
-  }
-
-  decoder_queue.close();
+  double value = av_q2d(frame_rate);
+  return value >= 1.0 && value <= 120.0;
 }
 
-void run_preprocess(Preprocessor &pre, ThreadQueue<StreamFrame> &decoder_queue,
+AVRational decoder_frame_rate(Decoder &decoder) {
+  AVStream *stream = decoder.formatCtx->streams[decoder.videoStreamIndex];
+  if (stream && sane_frame_rate(stream->avg_frame_rate))
+    return stream->avg_frame_rate;
+
+  if (stream && sane_frame_rate(stream->r_frame_rate))
+    return stream->r_frame_rate;
+
+  return AVRational{30, 1};
+}
+
+void run_decode(const AppConfig &config, std::atomic<int> &next_stream_index,
+                ThreadQueue<StreamFrame> &decoder_queue,
+                std::atomic<bool> &pipeline_ok) {
+  int stream_count = (int)config.input_urls.size();
+
+  while (true) {
+    int stream_index = next_stream_index++;
+    if (stream_index >= stream_count)
+      break;
+
+    const std::string &input_url = config.input_urls[stream_index];
+    log_msg(LOG_INFO, "decoder",
+            "stream " + std::to_string(stream_index) + " input: " + input_url);
+
+    Decoder decoder;
+    if (!openStream(decoder, input_url.c_str())) {
+      pipeline_ok = false;
+      continue;
+    }
+
+    AVRational frame_rate = decoder_frame_rate(decoder);
+    int64_t frame_count = 0;
+
+    while (nextFrame(decoder)) {
+      int64_t frame_id = frame_count++;
+      if (frame_count == 1)
+        log_msg(LOG_INFO, "decoder",
+                "stream " + std::to_string(stream_index) +
+                    " first frame decoded");
+
+      AVFrame *frame = av_frame_clone(decoder.frame);
+      if (!frame) {
+        log_msg(LOG_ERROR, "decoder", "could not clone decoded frame");
+        pipeline_ok = false;
+        break;
+      }
+
+      if (!decoder_queue.push(
+              StreamFrame{frame, stream_index, frame_id, frame_rate})) {
+        av_frame_free(&frame);
+        break;
+      }
+    }
+
+    closeStream(decoder);
+    log_msg(LOG_INFO, "decoder",
+            "stream " + std::to_string(stream_index) +
+                " decoded frames=" + std::to_string(frame_count));
+  }
+}
+
+void run_preprocess(ThreadQueue<StreamFrame> &decoder_queue,
                     ThreadQueue<StreamFrame> &preprocessor_queue) {
+  Preprocessor pre;
+  bool pre_ready = false;
+  int src_w = 0;
+  int src_h = 0;
+  int src_pix_fmt = -1;
   std::unique_ptr<float[]> cpu_input{new float[3 * 640 * 640]};
   StreamFrame item;
   while (decoder_queue.pop(item)) {
+    if (!pre_ready || src_w != item.frame->width ||
+        src_h != item.frame->height || src_pix_fmt != item.frame->format) {
+      if (pre_ready)
+        destroyPreprocess(pre);
+
+      src_w = item.frame->width;
+      src_h = item.frame->height;
+      src_pix_fmt = item.frame->format;
+      initPreprocess(pre, src_w, src_h, src_pix_fmt);
+      pre_ready = true;
+    }
+
     item.frame_rgb = preprocess(pre, item.frame, cpu_input.get());
     preprocessor_queue.push(std::move(item));
   }
 
-  preprocessor_queue.close();
+  if (pre_ready)
+    destroyPreprocess(pre);
 }
 
-void run_infer(Engine &engine,
-               std::vector<ThreadQueue<StreamFrame>> &preprocessor_queue,
-               std::vector<ThreadQueue<StreamFrame>> &inference_queue,
-               int num_workers) {
+void run_infer(Engine &engine, ThreadQueue<StreamFrame> &preprocessor_queue,
+               ThreadQueue<StreamFrame> &inference_queue, int batch_capacity) {
   std::unique_ptr<float[]> cpu_output{
       new float[engine.outputBytes / sizeof(float)]};
 
-  std::vector<bool> stream_done(preprocessor_queue.size(), false);
   std::vector<StreamFrame> stream_batch;
-  int active_streams = (int)preprocessor_queue.size();
   const int single_cpu_input = 3 * 640 * 640;
 
   std::vector<float> cpu_input;
-  cpu_input.resize(num_workers * single_cpu_input);
+  cpu_input.resize(batch_capacity * single_cpu_input);
+  stream_batch.reserve(batch_capacity);
 
-  while (active_streams > 0) {
-    bool did_work = false;
+  int64_t batch_count = 0;
+  int last_logged_batch_size = -1;
+  log_msg(LOG_INFO, "infer",
+          "shared inference thread started max_batch=" +
+              std::to_string(batch_capacity));
+
+  StreamFrame item;
+  while (preprocessor_queue.pop(item)) {
     stream_batch.clear();
 
-    for (int i = 0; i < (int)preprocessor_queue.size(); i++) {
-      if (stream_done[i])
-        continue;
+    int batch_index = (int)stream_batch.size();
+    std::copy(item.frame_rgb.get(), item.frame_rgb.get() + single_cpu_input,
+              cpu_input.data() + batch_index * single_cpu_input);
+    stream_batch.push_back(std::move(item));
 
-      StreamFrame item;
-      if (preprocessor_queue[i].try_pop(item)) {
-        did_work = true;
-        int batch_index = (int)stream_batch.size();
-        std::copy(item.frame_rgb.get(), item.frame_rgb.get() + single_cpu_input,
-                  cpu_input.data() + batch_index * single_cpu_input);
-        stream_batch.push_back(std::move(item));
-      } else if (preprocessor_queue[i].closed_and_empty()) {
-        stream_done[i] = true;
-        active_streams--;
-        inference_queue[i].close();
-      }
+    while ((int)stream_batch.size() < batch_capacity) {
+      StreamFrame next_item;
+      if (!preprocessor_queue.try_pop(next_item))
+        break;
+
+      batch_index = (int)stream_batch.size();
+      std::copy(next_item.frame_rgb.get(),
+                next_item.frame_rgb.get() + single_cpu_input,
+                cpu_input.data() + batch_index * single_cpu_input);
+      stream_batch.push_back(std::move(next_item));
     }
 
-    if (!stream_batch.empty()) {
-      std::unique_ptr<float[]> batch_output =
-          run_inference(engine, cpu_input.data(), cpu_output.get(),
-                        (int)stream_batch.size());
-      if (!batch_output)
-        continue;
-
-      for (int i = 0; i < (int)stream_batch.size(); i++) {
-        stream_batch[i].output.reset(new float[engine.outputElementsPerFrame]);
-        std::copy(batch_output.get() + i * engine.outputElementsPerFrame,
-                  batch_output.get() + (i + 1) * engine.outputElementsPerFrame,
-                  stream_batch[i].output.get());
-        inference_queue[stream_batch[i].stream_index].push(
-            std::move(stream_batch[i]));
-      }
+    int current_batch_size = (int)stream_batch.size();
+    if (current_batch_size != last_logged_batch_size || batch_count % 60 == 0) {
+      log_msg(LOG_INFO, "infer",
+              "batch=" + std::to_string(batch_count) +
+                  " size=" + std::to_string(current_batch_size));
+      last_logged_batch_size = current_batch_size;
     }
 
-    if (!did_work && active_streams > 0)
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::unique_ptr<float[]> batch_output = run_inference(
+        engine, cpu_input.data(), cpu_output.get(), current_batch_size);
+    if (!batch_output)
+      continue;
+
+    for (int i = 0; i < current_batch_size; i++) {
+      stream_batch[i].output.reset(new float[engine.outputElementsPerFrame]);
+      std::copy(batch_output.get() + i * engine.outputElementsPerFrame,
+                batch_output.get() + (i + 1) * engine.outputElementsPerFrame,
+                stream_batch[i].output.get());
+      inference_queue.push(std::move(stream_batch[i]));
+    }
+    batch_count++;
   }
+
+  log_msg(LOG_INFO, "infer", "shared inference thread stopped");
 }
 
 void run_postprocess(ThreadQueue<StreamFrame> &inference_queue,
                      ThreadQueue<StreamFrame> &postprocessor_queue,
-                     int max_dets, int width, int height) {
+                     int max_dets) {
   StreamFrame item;
   while (inference_queue.pop(item)) {
-    item.detections = postprocess(item.output.get(), max_dets, width, height);
+    item.detections = postprocess(item.output.get(), max_dets,
+                                  item.frame->width, item.frame->height);
     postprocessor_queue.push(std::move(item));
   }
-
-  postprocessor_queue.close();
 }
 
 void run_draw(ThreadQueue<StreamFrame> &postprocessor_queue,
@@ -190,123 +277,202 @@ void run_draw(ThreadQueue<StreamFrame> &postprocessor_queue,
     draw_box(item.detections, item.frame);
     encoder_queue.push(std::move(item));
   }
-
-  encoder_queue.close();
 }
 
-void run_encode(Encoder &encoder, Server &server,
-                ThreadQueue<StreamFrame> &encoder_queue,
-                std::atomic<bool> &stream_ok) {
-  StreamFrame item;
-  while (encoder_queue.pop(item)) {
-    if (!serve_stream(encoder, server, item.frame)) {
-      log_msg(LOG_ERROR, "main", "frame encode or publish failed");
-      stream_ok = false;
+bool encode_output_frame(OutputState &state, const AppConfig &config,
+                         StreamFrame &item, std::atomic<bool> &pipeline_ok) {
+  if (!state.output_opened) {
+    std::string output_url =
+        indexed_output_url(config.output_url, item.stream_index);
+    if (!open_encoder(state.encoder, item.frame->width, item.frame->height,
+                      (AVPixelFormat)item.frame->format, item.frame_rate)) {
+      pipeline_ok = false;
+      return false;
     }
+
+    if (!open_server(state.server, output_url.c_str(),
+                     state.encoder.codec_ctx)) {
+      close_encoder(state.encoder);
+      pipeline_ok = false;
+      return false;
+    }
+
+    state.output_opened = true;
   }
-}
 
-bool run_stream(
-    Engine &engine, const AppConfig &config, int stream_index,
-    std::vector<ThreadQueue<StreamFrame>> &preprocessor_shared_queue,
-    std::vector<ThreadQueue<StreamFrame>> &inference_shared_queue,
-    int max_batch_size) {
-  const std::string &input_url = config.input_urls[stream_index];
-  std::string output_url = indexed_output_url(config.output_url, stream_index);
-  ThreadQueue<StreamFrame> &preprocessor_queue =
-      preprocessor_shared_queue[stream_index];
-  ThreadQueue<StreamFrame> &inference_queue =
-      inference_shared_queue[stream_index];
-
-  log_msg(LOG_INFO, "main",
-          "stream " + std::to_string(stream_index) + " input: " + input_url);
-  log_msg(LOG_INFO, "main",
-          "stream " + std::to_string(stream_index) + " output: " + output_url);
-
-  Decoder decoder;
-  log_msg(LOG_INFO, "main", "input stream open started");
-  if (!openStream(decoder, input_url.c_str())) {
-    preprocessor_queue.close();
-    inference_queue.close();
+  if (!serve_stream(state.encoder, state.server, item.frame)) {
+    log_msg(LOG_ERROR, "main", "frame encode or publish failed");
+    pipeline_ok = false;
     return false;
   }
-  log_msg(LOG_INFO, "main", "input stream open finished");
 
-  Preprocessor pre;
-  log_msg(LOG_INFO, "main", "preprocess setup started");
-  initPreprocess(pre, decoder.codecCtx->width, decoder.codecCtx->height,
-                 (int)decoder.codecCtx->pix_fmt);
-  log_msg(LOG_INFO, "main", "preprocess setup finished");
+  return true;
+}
 
-  int max_dets = (int)(engine.outputBytes /
-                       (sizeof(float) * max_batch_size * 6));
+void encode_ready_frames(OutputState &state, const AppConfig &config,
+                         std::atomic<bool> &pipeline_ok) {
+  while (true) {
+    auto it = state.pending_frames.find(state.next_frame_id);
+    if (it == state.pending_frames.end())
+      break;
+
+    encode_output_frame(state, config, it->second, pipeline_ok);
+    state.pending_frames.erase(it);
+    state.next_frame_id++;
+  }
+}
+
+void flush_output_state(OutputState &state, const AppConfig &config,
+                        std::atomic<bool> &pipeline_ok) {
+  std::lock_guard<std::mutex> lock(state.mutex);
+  while (!state.pending_frames.empty()) {
+    auto it = state.pending_frames.begin();
+    if (it->first != state.next_frame_id) {
+      log_msg(LOG_WARNING, "main",
+              "encoding stream with missing frame_id expected=" +
+                  std::to_string(state.next_frame_id) +
+                  " got=" + std::to_string(it->first));
+      state.next_frame_id = it->first;
+    }
+
+    encode_output_frame(state, config, it->second, pipeline_ok);
+    state.pending_frames.erase(it);
+    state.next_frame_id++;
+  }
+
+  if (state.output_opened) {
+    flush_encoder(state.encoder, state.server);
+    close_server(state.server);
+    close_encoder(state.encoder);
+    state.output_opened = false;
+  }
+}
+
+void run_encode(const AppConfig &config,
+                ThreadQueue<StreamFrame> &encoder_queue,
+                std::vector<std::unique_ptr<OutputState>> &output_states,
+                std::atomic<bool> &pipeline_ok) {
+  StreamFrame item;
+  while (encoder_queue.pop(item)) {
+    if (item.stream_index < 0 ||
+        item.stream_index >= (int)output_states.size()) {
+      log_msg(LOG_ERROR, "main", "encoded frame has invalid stream index");
+      pipeline_ok = false;
+      continue;
+    }
+
+    OutputState &state = *output_states[item.stream_index];
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    auto [_, inserted] =
+        state.pending_frames.emplace(item.frame_id, std::move(item));
+    if (!inserted) {
+      log_msg(LOG_ERROR, "main", "duplicate frame_id in encode queue");
+      pipeline_ok = false;
+      continue;
+    }
+
+    encode_ready_frames(state, config, pipeline_ok);
+  }
+}
+
+bool run_stream(Engine &engine, const AppConfig &config, int batch_size) {
+  int stream_count = (int)config.input_urls.size();
+  int max_dets = (int)(engine.outputElementsPerFrame / 6);
+  std::atomic<int> next_decode_stream{0};
+  std::atomic<bool> pipeline_ok{true};
+
+  ThreadQueue<StreamFrame> decoder_queue;
+  ThreadQueue<StreamFrame> preprocessor_queue;
+  ThreadQueue<StreamFrame> inference_queue;
+  ThreadQueue<StreamFrame> postprocessor_queue;
+  ThreadQueue<StreamFrame> encoder_queue;
+  std::vector<std::unique_ptr<OutputState>> output_states;
+
+  std::vector<std::thread> decoder_threads;
+  std::vector<std::thread> preprocess_threads;
+  std::vector<std::thread> postprocess_threads;
+  std::vector<std::thread> draw_threads;
+  std::vector<std::thread> encode_threads;
+
+  decoder_threads.reserve(config.decoder_threads_count);
+  preprocess_threads.reserve(config.preprocessor_threads_count);
+  postprocess_threads.reserve(config.postprocessor_threads_count);
+  draw_threads.reserve(config.drawer_threads_count);
+  encode_threads.reserve(config.encoder_threads_count);
+  output_states.reserve(stream_count);
 
   log_msg(LOG_INFO, "main",
           "max detections from model output: " + std::to_string(max_dets));
 
-  AVStream *in_stream = decoder.formatCtx->streams[decoder.videoStreamIndex];
-  Encoder encoder;
-  log_msg(LOG_INFO, "main", "encoder setup started");
-  if (!open_encoder(encoder, in_stream, decoder.codecCtx)) {
-    preprocessor_queue.close();
-    inference_queue.close();
-    destroyPreprocess(pre);
-    closeStream(decoder);
-    return false;
+  for (int i = 0; i < config.decoder_threads_count; i++) {
+    decoder_threads.emplace_back(
+        run_decode, std::ref(config), std::ref(next_decode_stream),
+        std::ref(decoder_queue), std::ref(pipeline_ok));
   }
-  log_msg(LOG_INFO, "main", "encoder setup finished");
 
-  Server server;
-  log_msg(LOG_INFO, "main", "output stream setup started");
-  if (!open_server(server, output_url.c_str(), encoder.codec_ctx)) {
-    preprocessor_queue.close();
-    inference_queue.close();
-    close_encoder(encoder);
-    destroyPreprocess(pre);
-    closeStream(decoder);
-    return false;
+  for (int i = 0; i < config.preprocessor_threads_count; i++) {
+    preprocess_threads.emplace_back(run_preprocess, std::ref(decoder_queue),
+                                    std::ref(preprocessor_queue));
   }
-  log_msg(LOG_INFO, "main", "output stream setup finished");
 
-  log_msg(LOG_INFO, "main", "frame processing loop started");
-  std::atomic<bool> stream_ok{true};
-  std::atomic<int64_t> frame_count{0};
+  std::thread infer_thread(run_infer, std::ref(engine),
+                           std::ref(preprocessor_queue),
+                           std::ref(inference_queue), batch_size);
 
-  ThreadQueue<StreamFrame> decoder_queue;
-  ThreadQueue<StreamFrame> postprocessor_queue;
-  ThreadQueue<StreamFrame> encoder_queue;
+  for (int i = 0; i < config.postprocessor_threads_count; i++) {
+    postprocess_threads.emplace_back(run_postprocess, std::ref(inference_queue),
+                                     std::ref(postprocessor_queue), max_dets);
+  }
 
-  std::thread decode_thread(run_decode, std::ref(decoder),
-                            std::ref(decoder_queue), stream_index,
-                            std::ref(frame_count), std::ref(stream_ok));
-  std::thread preprocess_thread(run_preprocess, std::ref(pre),
-                                std::ref(decoder_queue),
-                                std::ref(preprocessor_queue));
-  std::thread postprocess_thread(
-      run_postprocess, std::ref(inference_queue), std::ref(postprocessor_queue),
-      max_dets, decoder.codecCtx->width, decoder.codecCtx->height);
-  std::thread draw_thread(run_draw, std::ref(postprocessor_queue),
-                          std::ref(encoder_queue));
-  std::thread encode_thread(run_encode, std::ref(encoder), std::ref(server),
-                            std::ref(encoder_queue), std::ref(stream_ok));
+  for (int i = 0; i < config.drawer_threads_count; i++) {
+    draw_threads.emplace_back(run_draw, std::ref(postprocessor_queue),
+                              std::ref(encoder_queue));
+  }
 
-  decode_thread.join();
-  preprocess_thread.join();
-  postprocess_thread.join();
-  draw_thread.join();
-  encode_thread.join();
+  for (int stream_index = 0; stream_index < stream_count; stream_index++) {
+    output_states.push_back(std::make_unique<OutputState>());
 
-  log_msg(LOG_INFO, "main",
-          "frame loop ended after " + std::to_string(frame_count.load()) +
-              " frames");
-  log_msg(LOG_INFO, "main", "flushing encoder");
-  flush_encoder(encoder, server);
-  close_server(server);
-  close_encoder(encoder);
-  destroyPreprocess(pre);
-  closeStream(decoder);
-  log_msg(LOG_INFO, "main", "shutdown complete");
-  return stream_ok;
+    std::string output_url =
+        indexed_output_url(config.output_url, stream_index);
+    log_msg(LOG_INFO, "main",
+            "stream " + std::to_string(stream_index) +
+                " output: " + output_url);
+  }
+
+  for (int i = 0; i < config.encoder_threads_count; i++) {
+    encode_threads.emplace_back(run_encode, std::ref(config),
+                                std::ref(encoder_queue),
+                                std::ref(output_states), std::ref(pipeline_ok));
+  }
+
+  for (auto &thread : decoder_threads)
+    thread.join();
+  decoder_queue.close();
+
+  for (auto &thread : preprocess_threads)
+    thread.join();
+  preprocessor_queue.close();
+
+  infer_thread.join();
+  inference_queue.close();
+
+  for (auto &thread : postprocess_threads)
+    thread.join();
+  postprocessor_queue.close();
+
+  for (auto &thread : draw_threads)
+    thread.join();
+
+  encoder_queue.close();
+
+  for (auto &thread : encode_threads)
+    thread.join();
+
+  for (auto &state : output_states)
+    flush_output_state(*state, config, pipeline_ok);
+
+  return pipeline_ok;
 }
 
 int main(int argc, char **argv) {
@@ -322,8 +488,9 @@ int main(int argc, char **argv) {
 
   if (config.build) {
     log_msg(LOG_INFO, "main", "TensorRT engine build started");
-    bool built = build_engine_file(config.model_path.c_str(),
-                                   config.engine_path.c_str());
+    bool built =
+        build_engine_file(config.model_path.c_str(), config.engine_path.c_str(),
+                          config.max_batch_size);
     log_msg(LOG_INFO, "main", "TensorRT engine build finished");
     return built ? 0 : -1;
   }
@@ -334,20 +501,30 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  if (config.num_workers < 1) {
-    log_msg(LOG_ERROR, "main", "--workers must be at least 1");
-    return -1;
-  }
+  int hardware_threads =
+      (int)std::thread::hardware_concurrency(); // 24 - 20 - 19
+  int reserved_threads = hardware_threads >= 16  ? 4
+                         : hardware_threads >= 8 ? 2
+                                                 : 1;
+  constexpr int inference_threads_count = 1;
+  int max_threads =
+      hardware_threads - reserved_threads - inference_threads_count;
+  int stream_count = input_count;
 
-  int hardware_threads = (int)std::thread::hardware_concurrency();
-  int max_threads = hardware_threads > 4 ? hardware_threads - 4 : 1;
-  constexpr int stage_threads_per_stream = 5;
-  int max_stream_workers = std::max(1, max_threads / stage_threads_per_stream);
-  int worker_count =
-      std::min({input_count, config.num_workers, max_stream_workers});
+  config.decoder_threads_count = stream_count;
+  config.preprocessor_threads_count =
+      std::max(config.preprocessor_threads_count, max_threads * 1 / 10);
+  config.postprocessor_threads_count =
+      std::max(config.postprocessor_threads_count, max_threads * 1 / 10);
+  config.drawer_threads_count =
+      std::max(config.drawer_threads_count, max_threads * 1 / 10);
+  config.encoder_threads_count =
+      std::max(config.encoder_threads_count, max_threads * 3 / 10);
+
+  int batch_size = std::min(stream_count, config.max_batch_size);
 
   Engine engine;
-  engine = load_engine(config.engine_path.c_str(), worker_count);
+  engine = load_engine(config.engine_path.c_str(), batch_size);
   log_msg(LOG_INFO, "main", "TensorRT engine load finished");
 
   if (!engine.context || !engine.inputBuffer || !engine.outputBuffer) {
@@ -356,22 +533,7 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  std::vector<ThreadQueue<StreamFrame>> preprocessor_shared_queue(worker_count);
-  std::vector<ThreadQueue<StreamFrame>> inference_shared_queue(worker_count);
-  std::thread infer_thread(run_infer, std::ref(engine),
-                           std::ref(preprocessor_shared_queue),
-                           std::ref(inference_shared_queue), worker_count);
-
-  std::vector<std::thread> t(worker_count);
-  for (int i = 0; i < worker_count; i++) {
-    t[i] = std::thread(run_stream, std::ref(engine), std::ref(config), i,
-                       std::ref(preprocessor_shared_queue),
-                       std::ref(inference_shared_queue), worker_count);
-  }
-  for (int i = 0; i < worker_count; i++)
-    t[i].join();
-  infer_thread.join();
-
+  bool stream_ok = run_stream(engine, config, batch_size);
   destroy_engine(engine);
-  return 0;
+  return stream_ok ? 0 : -1;
 }

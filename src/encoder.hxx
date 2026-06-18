@@ -16,6 +16,8 @@ struct Encoder {
 
 bool open_encoder(Encoder &e, AVStream *in_stream,
                   AVCodecContext *decoder_codec_ctx);
+bool open_encoder(Encoder &e, int width, int height, AVPixelFormat pix_fmt,
+                  AVRational fps);
 bool serve_stream(Encoder &e, Server &s, AVFrame *frame);
 bool flush_encoder(Encoder &e, Server &s);
 void close_encoder(Encoder &e);

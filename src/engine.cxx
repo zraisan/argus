@@ -123,7 +123,8 @@ bool write_engine_file(const char *engine_path, const void *data,
 
 } // namespace
 
-bool build_engine_file(const char *onnx_path, const char *engine_path) {
+bool build_engine_file(const char *onnx_path, const char *engine_path,
+                       int batch_size) {
   log_msg(LOG_INFO, "engine",
           std::string("creating TensorRT builder for ") + onnx_path);
   std::unique_ptr<IBuilder> builder{createInferBuilder(logger)};
@@ -181,8 +182,8 @@ bool build_engine_file(const char *onnx_path, const char *engine_path) {
     Dims min_dims = input_dims, opt_dims = input_dims, max_dims = input_dims;
 
     min_dims.d[0] = 1;
-    opt_dims.d[0] = 4;
-    max_dims.d[0] = 16;
+    opt_dims.d[0] = std::max(1, batch_size / 2);
+    max_dims.d[0] = batch_size;
     if (input_dims.nbDims >= 4) {
       min_dims.d[2] = opt_dims.d[2] = max_dims.d[2] = 640;
       min_dims.d[3] = opt_dims.d[3] = max_dims.d[3] = 640;
@@ -222,6 +223,7 @@ bool build_engine_file(const char *onnx_path, const char *engine_path) {
 
 Engine load_engine(const char *engine_path, int batch_size) {
   Engine e;
+  e.maxBatchSize = batch_size;
   std::ifstream file(engine_path, std::ios::binary | std::ios::ate);
   if (!file) {
     log_msg(LOG_CRITICAL, "engine",
@@ -332,6 +334,18 @@ Engine load_engine(const char *engine_path, int batch_size) {
 
 std::unique_ptr<float[]> run_inference(Engine &e, const float *cpu_input,
                                        float *cpu_output, int batch_size) {
+  if (batch_size < 1 || batch_size > e.maxBatchSize) {
+    log_msg(LOG_ERROR, "engine",
+            "invalid inference batch size=" + std::to_string(batch_size) +
+                " max=" + std::to_string(e.maxBatchSize));
+    return nullptr;
+  }
+
+  if (e.inputName.empty() || e.outputName.empty()) {
+    log_msg(LOG_ERROR, "engine", "TensorRT tensor names are not initialized");
+    return nullptr;
+  }
+
   Dims input_dims = e.context->getTensorShape(e.inputName.c_str());
   input_dims.d[0] = batch_size;
   if (!e.context->setInputShape(e.inputName.c_str(), input_dims)) {
