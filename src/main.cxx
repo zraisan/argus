@@ -511,7 +511,8 @@ int main(int argc, char **argv) {
       hardware_threads - reserved_threads - inference_threads_count;
   int stream_count = input_count;
 
-  config.decoder_threads_count = stream_count;
+  config.decoder_threads_count =
+      std::max(config.decoder_threads_count, max_threads * 3 / 10);
   config.preprocessor_threads_count =
       std::max(config.preprocessor_threads_count, max_threads * 1 / 10);
   config.postprocessor_threads_count =

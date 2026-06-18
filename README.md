@@ -46,18 +46,28 @@ and re-published through RTSP.
 
 ```mermaid
 flowchart TD
-    input[Stream input] --> decoder[FFmpeg decoder]
-    decoder --> frame[AVFrame]
-    frame --> preprocess[Preprocess]
-    preprocess --> trt[TensorRT YOLO]
-    trt --> postprocess[Postprocess detections]
-    postprocess --> draw[Draw bounding boxes]
-    draw --> encoder[NVIDIA H.264 encoder]
-    encoder --> server[FFmpeg muxer]
-    server --> output[Stream output]
+    input[Input URLs] --> decode[Decode threads]
+    decode --> decoded_q[Decoded frame queue]
+    decoded_q --> preprocess[Preprocess threads]
+    preprocess --> tensor_q[Preprocessed tensor queue]
+    tensor_q --> infer[TensorRT batch inference]
+    infer --> result_q[Inference result queue]
+    result_q --> postprocess[Postprocess threads]
+    postprocess --> post_q[Postprocessed frame queue]
+    post_q --> draw[Draw threads]
+    draw --> encode_q[Encode queue]
+    encode_q --> encode[Encode threads]
+    encode --> state[Per-stream encoder and muxer state]
+    state --> order[Frame ordering by frame_id]
+    order --> output[Stream outputs]
 ```
 
 </div>
+
+Decode opens one FFmpeg decoder per input stream. Later stages use shared
+queues and stage thread pools. TensorRT receives batches up to the configured
+engine batch size, and encode keeps per-stream output state so each stream is
+written in frame order.
 
 ## Requirements
 
